@@ -272,7 +272,7 @@ python scripts/backtest.py 000001 600519 --start 20200101 --end 20251231 --short
 - 新用法通过 `--strategy` 选择策略、`--params k=v,k=v` 覆盖注册参数，例如：
 
 ```bash
-python scripts/backtest.py 000001 600519 --strategy rsi --params period=14,oversold=30,overbought=70
+python scripts/backtest.py 000001 600519 --strategy rsi --params period=14,oversold=30,exit_level=70
 python scripts/backtest.py 000001 --strategy bollinger --params period=20,num_std=2.0
 python scripts/backtest.py 000001 --strategy momentum --params lookback=120,skip=5,threshold=0.0
 ```

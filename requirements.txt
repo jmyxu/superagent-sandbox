@@ -1,3 +1,4 @@
-# 量化学习平台第 1 步依赖（scripts/fetch_daily.py）
+# 量化学习平台第 1~2 步依赖（scripts/fetch_daily.py、scripts/backtest.py）
 akshare>=1.20.22
 pandas>=2.2
+matplotlib>=3.8

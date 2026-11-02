@@ -1,0 +1,2 @@
+﻿symbol,short,long,start,end,adjust,strat_total,strat_annual,strat_mdd,strat_win_rate,strat_trades,bh_total,bh_annual,bh_mdd,bench_total,bench_annual,bench_mdd,bench_source,data_source,fractional
+000001,20,60,20200101,20251231,qfq,0.17397226700000257,0.028168869249401096,-0.5040219252090722,0.2857142857142857,14,-0.216823785351704,-0.04144529940138675,-0.6927899686520376,0.11504606789442118,0.019039268436369827,-0.45602619548225387,akshare.stock_zh_index_daily(新浪),本地CSV data\daily\000001_qfq.csv,False

@@ -6,4 +6,8 @@ A tiny demo project for testing the dsh-superagent deployment.
 
 ```bash
 python app.py
+# Hello, world!
+
+python app.py --name Alice
+# Hello, Alice!
 ```

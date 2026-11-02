@@ -1,0 +1,8 @@
+# 拉取的数据文件，不进入版本库
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

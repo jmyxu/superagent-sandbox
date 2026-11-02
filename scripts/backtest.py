@@ -1,13 +1,25 @@
-"""MA 金叉/死叉策略回测框架（量化学习项目第 2 步）。
+"""可插拔策略回测引擎（量化学习项目第 3 步）。
 
-策略规则（极简、可复现）：
-  1. 金叉：短期均线(MA_short)上穿长期均线(MA_long) → 下一交易日以开盘价全仓买入；
-  2. 死叉：短期均线下穿长期均线 → 下一交易日以开盘价清仓卖出；
-  3. 信号用当日收盘价计算、次日开盘价成交，避免"当日信号当日收盘成交"的未来函数；
-  4. 买入单位为 1 手 = 100 股；买入付佣金 --commission（默认万三），
+策略与引擎分离：
+  - 策略定义在 scripts/strategies.py：Strategy 基类（参数注册 + 信号生成），
+    内置 ma_cross（第 2 步双均线）、rsi（RSI 超卖反转）、bollinger（布林带
+    均值回归）、momentum（绝对动量/动量轮动到现金），各注明参考来源链接；
+  - 本文件是统一回测引擎：数据加载 → 策略信号 → 按仓位变化成交 →
+    统一报告输出（指标对比表、交易明细 CSV、每日净值 CSV、收益曲线 PNG、
+    汇总 CSV），任何策略共用同一套输出格式。
+
+执行规则（统一、可复现）：
+  1. 信号语义：策略在 t 日收盘后给出目标仓位 positions[t]（0=空仓持现金，
+     1=全仓做多）；引擎只在仓位**发生变化**时交易（边沿触发），
+     t 日的仓位变化在 t+1 日以开盘价成交——避免"当日信号当日收盘成交"的未来函数；
+  2. 回测窗口 [start, end] 内只响应窗口内产生的仓位变化；窗口开始前已持有的
+     状态不继承，需要新的边沿信号才会入场；
+  3. 买入单位为 1 手 = 100 股；买入付佣金 --commission（默认万三），
      卖出付佣金 + 印花税 --stamp（默认万五）；
      加 --fractional 可改用小数股数全仓（学术回测口径，研究信号本身时用）；
-  5. 回测期末若仍持仓，按最后收盘价强制平仓并计入交易明细与胜率。
+  4. 回测期末若仍持仓，按最后收盘价强制平仓并计入交易明细与胜率；
+  5. 策略所需的热身数据（如均线窗口）由策略的 warmup 属性声明，
+     数据加载时自动把拉取起点前移。
 
 数据来源：
   - 优先读取第 1 步 scripts/fetch_daily.py 产出的 CSV（data/daily/<代码>_<复权方式>.csv）；
@@ -15,19 +27,24 @@
     1. 直接调用 fetch_daily（akshare 东财接口，与第 1 步同源）；
     2. 东财接口被限流/封禁时，切换 akshare 腾讯日线接口（同样支持 qfq/hfq 复权）；
     3. 腾讯接口失败时，切换 akshare 新浪日线接口（同样支持 qfq/hfq 复权）；
-  - 自动把起始日期前移，为长期均线预留"热身"数据（否则回测区间开头若干天
-    没有均线、无法产生信号）；
   - 基准为沪深 300 指数（000300）同期走势，东财接口失败时自动切换新浪备用源。
     注意：不同数据源的复权口径可能存在细微差异，跨源比对结果时需留意。
 
-输出：
+输出（统一报告）：
   - 控制台打印：总收益率、年化收益率、最大回撤、胜率、交易次数
     （策略 vs 买入持有 vs 沪深300 三列对比）；
-  - output/backtest/ 下保存：交易明细 CSV、每日净值 CSV、收益曲线图 PNG（含回撤子图）；
+  - output/backtest/ 下按 <代码>_<策略标签> 保存：交易明细 CSV、每日净值 CSV、
+    收益曲线图 PNG（含回撤子图）；多标的运行另存 summary_<策略名>.csv 汇总；
   - 报告与图表均明确标注：历史模拟回测不代表未来，不构成投资建议。
 
 用法示例：
+  # 第 2 步双均线（默认策略，--short/--long 继续可用）
   python scripts/backtest.py 000001 600519 --start 20200101 --end 20251231 --short 5 --long 20
+
+  # 任一注册策略 + 任意注册参数（k=v,k=v）
+  python scripts/backtest.py 000001 --strategy rsi --params period=14,oversold=30,exit_level=70
+  python scripts/backtest.py 000001 --strategy bollinger --params period=20,num_std=2.0
+  python scripts/backtest.py 000001 --strategy momentum --params lookback=120,skip=5,threshold=0.0
 """
 
 from __future__ import annotations
@@ -47,6 +64,8 @@ import pandas as pd
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
+
+from strategies import Strategy, create_strategy, list_strategies  # noqa: E402
 
 LOT_SIZE = 100  # A 股买入单位：1 手 = 100 股
 TRADING_DAYS = 252  # 年化收益率使用的年交易日数
@@ -72,14 +91,24 @@ class Trade:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MA 金叉/死叉策略回测（沪深300基准对比），输出收益指标、交易明细与收益曲线图",
-        epilog="示例: python scripts/backtest.py 000001 --start 20200101 --end 20251231 --short 5 --long 20",
+        description="可插拔策略回测引擎（沪深300基准对比），统一输出收益指标、交易明细与收益曲线图",
+        epilog=(
+            "示例: python scripts/backtest.py 000001 --strategy rsi --params period=14,oversold=30\n"
+            "内置策略与默认参数:\n" + list_strategies()
+        ),
     )
     parser.add_argument("symbols", nargs="+", help="股票代码，可传多个，如 000001 600519")
-    parser.add_argument("--start", default=None, help="回测开始日期 YYYYMMDD，默认取数据起点（长期均线就绪之后）")
+    parser.add_argument("--start", default=None, help="回测开始日期 YYYYMMDD，默认取数据起点（策略热身完成之后）")
     parser.add_argument("--end", default=None, help="回测结束日期 YYYYMMDD，默认今天")
-    parser.add_argument("--short", type=int, default=5, help="短期均线窗口（交易日），默认 5")
-    parser.add_argument("--long", type=int, default=20, help="长期均线窗口（交易日），默认 20")
+    parser.add_argument("--strategy", default="ma_cross",
+                        help="策略名: ma_cross/ma（第2步双均线，默认）、rsi、bollinger、momentum")
+    parser.add_argument("--params", default=None,
+                        help="策略参数覆盖，逗号分隔的 k=v 对，如 period=14,oversold=30；"
+                             "仅接受策略注册过的参数")
+    parser.add_argument("--short", type=int, default=None,
+                        help="[仅 ma_cross] 短期均线窗口（交易日），默认取策略默认值 5")
+    parser.add_argument("--long", type=int, default=None,
+                        help="[仅 ma_cross] 长期均线窗口（交易日），默认取策略默认值 20")
     parser.add_argument("--adjust", choices=["qfq", "hfq", "none"], default="qfq",
                         help="复权方式: qfq 前复权(默认) / hfq 后复权 / none 不复权")
     parser.add_argument("--datadir", default="data/daily", help="第 1 步 CSV 目录，默认 data/daily")
@@ -95,13 +124,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="只用本地 CSV、不访问网络；CSV 覆盖不足时降级使用并告警（无基准数据则报错）")
     parser.add_argument("--no-plot", action="store_true", help="不生成 PNG 图（参数敏感性批量跑时用）")
     args = parser.parse_args(argv)
-    if args.short <= 0 or args.long <= 0:
-        parser.error("--short/--long 必须为正整数")
-    if args.short >= args.long:
-        parser.error(f"短期均线窗口({args.short})必须小于长期均线窗口({args.long})")
+    if args.short is not None and args.short <= 0:
+        parser.error("--short 必须为正整数")
+    if args.long is not None and args.long <= 0:
+        parser.error("--long 必须为正整数")
     if args.capital <= 0:
         parser.error("--capital 必须为正数")
     return args
+
+
+def parse_params(text: str) -> dict[str, str]:
+    """把 'period=14,oversold=30.5' 解析为 {k: v}（v 保持字符串，由策略做类型转换与校验）。"""
+    out: dict[str, str] = {}
+    for piece in text.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "=" not in piece:
+            raise ValueError(f"--params 应为 k=v 形式，收到: {piece!r}")
+        key, value = piece.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if not key or value == "":
+            raise ValueError(f"--params 键值不能为空: {piece!r}")
+        out[key] = value
+    return out
+
+
+def build_strategy(args: argparse.Namespace) -> Strategy:
+    """按 CLI 参数构造策略：--params 覆盖注册参数；--short/--long 是 ma_cross 的兼容入口。"""
+    params: dict[str, str] = {}
+    if args.params:
+        params.update(parse_params(args.params))
+    if args.strategy in ("ma_cross", "ma"):
+        if args.short is not None and "short" not in params:
+            params["short"] = str(args.short)
+        if args.long is not None and "long" not in params:
+            params["long"] = str(args.long)
+    elif args.short is not None or args.long is not None:
+        print("[warn] --short/--long 仅适用于 ma_cross 策略，已忽略", file=sys.stderr)
+    return create_strategy(args.strategy, **params)
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +205,12 @@ def load_stock(
     datadir: str,
     offline: bool,
     retries: int,
-    long_ma: int,
+    warmup: int,
 ) -> tuple[pd.DataFrame, str]:
     """读取第 1 步产出的 CSV；覆盖不足时按 东财→腾讯→新浪 顺序拉取并落盘。
 
-    返回 (日线数据, 数据来源说明)。
+    返回 (日线数据, 数据来源说明)。warmup 为策略热身所需的最少交易日数，
+    拉取起点会自动前移预留。
     """
     csv_path = Path(datadir) / f"{symbol}_{adjust}.csv"
     if csv_path.exists():
@@ -169,7 +231,7 @@ def load_stock(
             f"{symbol}: 无覆盖完整的本地 CSV（{csv_path}），offline 模式无法联网拉取"
         )
 
-    warm_days = int(long_ma * 1.6) + 10  # 交易日约占自然日 70%，预留长均线热身
+    warm_days = int(warmup * 1.6) + 10  # 交易日约占自然日 70%，预留策略热身数据
     warm_start = None
     if start is not None:
         warm_start = (datetime.strptime(start, "%Y%m%d") - timedelta(days=warm_days)).strftime("%Y%m%d")
@@ -274,31 +336,26 @@ def load_benchmark(
 
 def run_backtest(
     df: pd.DataFrame,
+    strategy: Strategy,
     start: str | None,
     end: str | None,
-    short: int,
-    long: int,
     capital: float,
     commission: float,
     stamp: float,
     fractional: bool = False,
 ) -> tuple[np.ndarray, list[Trade], int, int]:
-    """执行金叉/死叉回测，返回 (每日净值数组, 交易列表, 回测窗口起始下标, 因整手约束被跳过的信号数)。
+    """执行策略回测，返回 (每日净值数组, 交易列表, 回测窗口起始下标, 因整手约束被跳过的信号数)。
 
-    均线在全量数据上计算（含热身段），但只在 [start, end] 窗口内允许开仓，
-    避免"回测区间开头无均线、无信号"的偏差。
+    仓位边沿触发：策略在 t-1 日收盘后给出目标仓位（相对 t-2 日发生变化），
+    则 t 日开盘成交；信号在全量数据（含热身段）上计算，但只在 [start, end]
+    窗口内允许交易，且仓位变化必须发生在窗口内——避免"回测区间开头无信号
+    偏差"与未来函数。
     """
+    positions = strategy.positions(df)
+    pos_valid = ~np.isnan(positions)
     close = df["close"].values
     open_ = df["open"].values
-    ma_s = pd.Series(close).rolling(short).mean().values
-    ma_l = pd.Series(close).rolling(long).mean().values
     n = len(df)
-
-    valid = ~np.isnan(ma_l) & ~np.isnan(ma_s)
-    cross_up = valid & (ma_s > ma_l)
-    cross_up &= pd.Series(ma_s).shift(1).le(pd.Series(ma_l).shift(1)).values
-    cross_down = valid & (ma_s < ma_l)
-    cross_down &= pd.Series(ma_s).shift(1).ge(pd.Series(ma_l).shift(1)).values
 
     in_window = np.ones(n, dtype=bool)
     if start is not None:
@@ -315,8 +372,9 @@ def run_backtest(
     lot_skips = 0
 
     for t in range(n):
-        if t >= 1 and in_window[t] and in_window[t - 1]:
-            if shares == 0 and cross_up[t - 1]:
+        if t >= 2 and in_window[t] and in_window[t - 1] and pos_valid[t - 1] and pos_valid[t - 2]:
+            prev, older = positions[t - 1], positions[t - 2]
+            if shares == 0 and prev == 1 and older == 0:
                 px = open_[t] * (1 + commission)
                 if fractional:
                     shares = cash / px
@@ -328,7 +386,7 @@ def run_backtest(
                     entry_i, entry_px = t, px
                 else:
                     lot_skips += 1  # 信号出现但资金不足一手（高股价+小资金），无法买入
-            elif shares > 0 and cross_down[t - 1]:
+            elif shares > 0 and prev == 0 and older == 1:
                 px = open_[t] * (1 - commission - stamp)
                 trades.append(Trade(
                     entry_date=df["date"].iloc[entry_i],
@@ -338,7 +396,7 @@ def run_backtest(
                     shares=shares,
                     net_return=px / entry_px - 1,
                     holding_days=t - entry_i,
-                    exit_reason="死叉卖出",
+                    exit_reason="仓位变空卖出",
                 ))
                 cash += shares * px
                 shares = 0
@@ -360,12 +418,12 @@ def run_backtest(
         ))
         equity[-1] = cash + shares * px
 
-    # 回测窗口起点：显式指定 start 用其第一个交易日；否则用长期均线就绪后的第一个交易日
+    # 回测窗口起点：显式指定 start 用其第一个交易日；否则用策略首个信号就绪的交易日
     if start is not None:
         idx = np.flatnonzero(df["date"].values >= pd.Timestamp(start))
         eval_start = int(idx[0]) if len(idx) else n - 1
     else:
-        idx = np.flatnonzero(valid)
+        idx = np.flatnonzero(pos_valid)
         eval_start = int(idx[0]) if len(idx) else n - 1
     return equity, trades, eval_start, lot_skips
 
@@ -421,8 +479,7 @@ def plot_equity_curve(
     bench_dates: pd.Series,
     bench: np.ndarray,
     symbol: str,
-    short: int,
-    long: int,
+    label: str,
     period_label: str,
     out_png: Path,
 ) -> None:
@@ -433,10 +490,10 @@ def plot_equity_curve(
     fig, (ax1, ax2) = plt.subplots(
         2, 1, figsize=(10, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1]}
     )
-    ax1.plot(dates, strat, label="MA 金叉/死叉策略", lw=1.5, color="tab:blue")
+    ax1.plot(dates, strat, label=label, lw=1.5, color="tab:blue")
     ax1.plot(dates, bh, label="买入持有（同期）", lw=1.0, alpha=0.7, color="tab:orange")
     ax1.plot(bench_dates, bench, label="沪深300基准", lw=1.0, alpha=0.7, color="tab:green")
-    ax1.set_title(f"{symbol} · MA{short}/{long} 金叉死叉回测（{period_label}）")
+    ax1.set_title(f"{symbol} · {label}（{period_label}）")
     ax1.set_ylabel("净值（期初=1）")
     ax1.legend(loc="upper left")
     ax1.grid(alpha=0.3)
@@ -461,24 +518,25 @@ def _fmt_pct(x: float) -> str:
 def run_one(
     symbol: str,
     args: argparse.Namespace,
+    strategy: Strategy,
     benchmark: pd.DataFrame,
     bench_source: str,
     results: list[dict],
 ) -> bool:
     end = args.end or datetime.now().strftime("%Y%m%d")
     df, data_source = load_stock(symbol, args.start, end, args.adjust, args.datadir,
-                                 args.offline, args.retries, args.long)
+                                 args.offline, args.retries, strategy.warmup)
     if df.empty:
         print(f"[failed] {symbol}: 无可用行情数据", file=sys.stderr)
         return False
     print(f"[ok] {symbol}: 行情数据来自 {data_source}，{len(df)} 行")
 
     equity, trades, eval_start, lot_skips = run_backtest(
-        df, args.start, args.end, args.short, args.long,
+        df, strategy, args.start, args.end,
         args.capital, args.commission, args.stamp, args.fractional,
     )
     if lot_skips:
-        print(f"[warn] {symbol}: 有 {lot_skips} 次金叉信号因资金不足一手而未能买入"
+        print(f"[warn] {symbol}: 有 {lot_skips} 次买入信号因资金不足一手而未能买入"
               f"（当前资金 {args.capital:,.0f} 元）；加 --fractional 可用小数股数全仓研究信号本身",
               file=sys.stderr)
     dates = df["date"]
@@ -502,18 +560,20 @@ def run_one(
     suffix = f"_{args.tag}" if args.tag else ""
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    label = strategy.label()
+    fname = strategy.file_label()
 
-    # 每日净值 CSV（含基准）
+    # 每日净值 CSV（含基准）—— 统一报告格式
     pd.DataFrame({
         "date": dates,
         "close": df["close"].values,
         "strategy_equity": strat,
         "buy_hold": bh,
         "benchmark_300": bench_curve,
-    }).to_csv(outdir / f"{symbol}_ma{args.short}_{args.long}{suffix}_equity.csv",
+    }).to_csv(outdir / f"{symbol}_{fname}{suffix}_equity.csv",
               index=False, encoding="utf-8-sig")
 
-    # 交易明细 CSV
+    # 交易明细 CSV —— 统一报告格式
     if trades:
         pd.DataFrame([{
             "entry_date": t.entry_date.strftime("%Y-%m-%d"),
@@ -525,7 +585,7 @@ def run_one(
             "holding_days": t.holding_days,
             "exit_reason": t.exit_reason,
         } for t in trades]).to_csv(
-            outdir / f"{symbol}_ma{args.short}_{args.long}{suffix}_trades.csv",
+            outdir / f"{symbol}_{fname}{suffix}_trades.csv",
             index=False, encoding="utf-8-sig",
         )
     else:
@@ -535,14 +595,14 @@ def run_one(
         plot_equity_curve(
             window_dates, strat[eval_start:], bh[eval_start:],
             window_dates, bench_curve[eval_start:],
-            symbol, args.short, args.long, period_label,
-            outdir / f"{symbol}_ma{args.short}_{args.long}{suffix}.png",
+            symbol, label, period_label,
+            outdir / f"{symbol}_{fname}{suffix}.png",
         )
 
     bh_metrics = compute_metrics(bh * args.capital, eval_start)
     bench_metrics = compute_metrics(bench_curve * args.capital, eval_start)
 
-    print(f"\n===== {symbol} · MA{args.short}/{args.long}（{period_label}，{args.adjust} 复权）=====")
+    print(f"\n===== {symbol} · {label}（{period_label}，{args.adjust} 复权）=====")
     print(pd.DataFrame({
         "策略": {
             "总收益率": _fmt_pct(metrics["total"]),
@@ -568,7 +628,7 @@ def run_one(
     }).to_string())  # 中文字段用 to_string 输出
 
     results.append({
-        "symbol": symbol, "short": args.short, "long": args.long,
+        "symbol": symbol, "strategy": strategy.name, "params": strategy.param_string(),
         "start": args.start or str(dates.iloc[eval_start].date()),
         "end": end, "adjust": args.adjust,
         "strat_total": metrics["total"], "strat_annual": metrics["annual"],
@@ -593,8 +653,13 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     args = parse_args(argv)
+    try:
+        strategy = build_strategy(args)
+    except ValueError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 2
     end = args.end or datetime.now().strftime("%Y%m%d")
-    print(f"回测区间: {args.start or '数据起点'} ~ {end} | MA{args.short}/{args.long} | "
+    print(f"回测区间: {args.start or '数据起点'} ~ {end} | 策略: {strategy.label()} | "
           f"复权: {args.adjust} | 初始资金: {args.capital:,.0f} | "
           f"成本: 佣金{args.commission:.2%} + 卖出印花税{args.stamp:.2%}")
 
@@ -611,7 +676,7 @@ def main(argv: list[str] | None = None) -> int:
             if not match:
                 raise ValueError(f"无法识别股票代码: {raw_symbol!r}")
             symbol = match.group(0)
-            if not run_one(symbol, args, benchmark, bench_source, results):
+            if not run_one(symbol, args, strategy, benchmark, bench_source, results):
                 failed.append(raw_symbol)
         except Exception as exc:  # noqa: BLE001 单只失败不中断批量任务
             print(f"[failed] {raw_symbol}: {exc}", file=sys.stderr)
@@ -619,7 +684,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if results:
         suffix = f"_{args.tag}" if args.tag else ""
-        summary_path = Path(args.outdir) / f"summary{suffix}.csv"
+        summary_path = Path(args.outdir) / f"summary_{strategy.name}{suffix}.csv"
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(results).to_csv(summary_path, index=False, encoding="utf-8-sig")
         print(f"\n[ok] 汇总结果已保存: {summary_path}")

@@ -1,0 +1,3 @@
+﻿entry_date,entry_price_net,exit_date,exit_price_net,shares,net_return,holding_days,exit_reason
+2020-01-08,826.0377,2020-02-12,829.0762,100.0,0.003678,19,仓位变空卖出
+2020-03-23,740.9622,2020-04-01,857.0538,100.0,0.156677,7,仓位变空卖出

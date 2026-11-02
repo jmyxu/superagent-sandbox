@@ -1,0 +1,2 @@
+﻿symbol,strategy,params,start,end,adjust,strat_total,strat_annual,strat_mdd,strat_win_rate,strat_trades,bh_total,bh_annual,bh_mdd,bench_total,bench_annual,bench_mdd,bench_source,data_source,fractional
+600519,rsi,"period=14,oversold=30.0,exit_level=70.0",20200101,20251231,qfq,0.5244324990905331,0.07575552423125265,-0.30207711555274186,0.8333333333333334,6,0.5494407056067256,0.07879150781588673,-0.5129961802125684,0.11504606789442118,0.019039268436369827,-0.45602619548225387,akshare.stock_zh_index_daily(新浪),本地CSV data\daily\600519_qfq.csv,True

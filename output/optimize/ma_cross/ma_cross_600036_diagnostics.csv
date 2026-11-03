@@ -1,0 +1,27 @@
+﻿metric,value
+n_combos,24
+n_folds,3
+fractional,False
+data_source,本地CSV data\daily\600036_qfq.csv
+spearman_rho_is_oos,0.02086956521739128
+is_best_params,"short=5,long=60"
+is_best_mean_is_annual,0.08133912561477707
+is_best_mean_oos_total,0.06872541600000026
+is_best_mean_oos_annual,0.038186241884310856
+is_best_mean_oos_pct,0.5972222222222222
+is_best_neighbor_count,4
+is_best_neighbor_max_delta_is_annual,0.07094741062155652
+is_best_neighbor_max_delta_oos_annual,0.04212204697029601
+robust_params,"short=10,long=20"
+robust_mean_is_annual,-0.04720256321955089
+robust_mean_oos_annual,0.08022860185074998
+robust_mean_oos_rank,8.0
+robust_oos_topq_count,2
+default_params,"short=5,long=20"
+default_mean_is_annual,0.055193389674656736
+default_mean_oos_annual,0.013847286912933318
+robust_vs_default_oos_delta,0.06638131493781667
+flip_rate_is_topq_to_oos_botq,0.08333333333333333
+roughness_is_annual,0.0398055156123914
+roughness_oos_annual,0.01993699383770713
+disclaimer,历史模拟回测结果不代表未来表现，不构成投资建议。

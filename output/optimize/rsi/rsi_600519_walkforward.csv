@@ -1,0 +1,4 @@
+﻿fold,train_start,train_end,test_start,test_end,n_combos,is_best_params,is_best_is_total,is_best_is_annual,is_best_oos_total,is_best_oos_rank,is_best_oos_pct,oos_best_params,oos_best_oos_total,oos_best_is_total,default_oos_total,grid_mean_oos_total,grid_median_oos_total
+1,2020-01-01,2022-12-31,2023-01-01,2023-12-31,48,"period=14,oversold=35.0,exit_level=50.0",0.6370630890000009,0.08911878156512731,0.0,1,0.020833333333333332,"period=7,oversold=20.0,exit_level=50.0",0.0,0.012119785999999966,0.0,0.0,0.0
+2,2020-01-01,2023-12-31,2024-01-01,2024-12-31,48,"period=14,oversold=35.0,exit_level=50.0",0.6398311430000017,0.08943750835431596,0.0,1,0.020833333333333332,"period=7,oversold=20.0,exit_level=50.0",0.0,0.012119785999999966,0.0,0.0,0.0
+3,2020-01-01,2024-12-31,2025-01-01,2025-12-31,48,"period=14,oversold=35.0,exit_level=50.0",0.8666753220000019,0.11416111171702803,0.0,1,0.020833333333333332,"period=7,oversold=20.0,exit_level=50.0",0.0,0.012119785999999966,0.0,0.0,0.0

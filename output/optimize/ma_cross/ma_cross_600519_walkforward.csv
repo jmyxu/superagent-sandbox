@@ -1,0 +1,4 @@
+﻿fold,train_start,train_end,test_start,test_end,n_combos,is_best_params,is_best_is_total,is_best_is_annual,is_best_oos_total,is_best_oos_rank,is_best_oos_pct,oos_best_params,oos_best_oos_total,oos_best_is_total,default_oos_total,grid_mean_oos_total,grid_median_oos_total
+1,2020-01-01,2022-12-31,2023-01-01,2023-12-31,24,"short=15,long=30",0.9102250540000016,0.11862026474364362,0.0,1,0.041666666666666664,"short=3,long=20",0.0,0.4085634190000009,0.0,0.0,0.0
+2,2020-01-01,2023-12-31,2024-01-01,2024-12-31,24,"short=15,long=30",1.2164206540000024,0.14779818504721431,0.0,1,0.041666666666666664,"short=3,long=20",0.0,0.4011575890000021,0.0,0.0,0.0
+3,2020-01-01,2024-12-31,2025-01-01,2025-12-31,24,"short=15,long=30",0.7383355480000031,0.10050026443059124,0.0,1,0.041666666666666664,"short=3,long=20",0.0,0.4168297840000037,0.0,0.0,0.0

@@ -1,8 +1,9 @@
 """横截面选股研究（量化学习项目第 6 步）。
 
 以沪深300 + 中证500 成分股为股票池（约 800 只，全市场留作后续扩展），
-用 akshare 分批限速拉取 qfq 日线（增量缓存 + 断点续跑），计算**动量**与
-**波动率**因子，按月排序选出 Top-N 组合并回测，与沪深300 对比。
+用 akshare 分批限速拉取 qfq 日线（增量缓存 + 断点续跑），计算**动量**、
+**短期反转**与**波动率**因子，按月排序选出 Top-N 组合并回测，与沪深300
+对比。
 
 用法：
     # 自检（合成数据，不访问网络）
@@ -14,7 +15,7 @@
     # 查看拉取进度 / 失败清单
     python scripts/screener.py status
 
-    # 2) 因子计算 + 月度 Top-N 回测（默认动量与低波动各一组）
+    # 2) 因子计算 + 月度 Top-N 回测（默认动量、短期反转与低波动各一组）
     python scripts/screener.py backtest
 
 数据坑与口径（详见 docs/optimization-log.md 第 8 章）：
@@ -47,9 +48,11 @@
     调仓换手之和 / 年数；
   - 组合等权（1/N）；不可交易股票份额留现金。
 
-调研来源（经典选股因子）见 docs/quant-factor-research.md 与本日志第 8 章，
+调研来源（经典选股因子）见 docs/quant-factor-research.md 与本日志第 8/11 章，
 关键文献：
   - Jegadeesh & Titman (1993), J. Finance 48(1) 65-91（动量 12-1 口径）；
+  - Jegadeesh (1990), J. Finance 45(3) 881-898、Lehmann (1990), QJE 105(1)
+    1-28（短期反转；A 股 1 周~1 月反转显著强于中期动量，见第 11 章）；
   - Liu, Stambaugh & Yuan (2019), JFE（中国价值因子：E/P 优于 B/P、壳价值
     污染、剔除最小 30% 市值）；
   - Ang, Hodrick, Xing & Zhang (2006), J. Finance（低波动/特质波动率异象）；
@@ -437,6 +440,20 @@ def factor_momentum(close: np.ndarray, t: int, lookback: int, skip: int,
     return out
 
 
+def factor_reversal(close: np.ndarray, t: int, lookback: int, skip: int,
+                    min_bars: int) -> np.ndarray:
+    """短期反转因子（A 股特色）：过去 lookback 个交易日的累计收益，跳过
+    最近 skip 个交易日（默认 21/5 ≈ 1 个月跳过 1 周，跳过期避免 bid-ask
+    bounce 与微观结构噪声）。
+
+    数学口径与 factor_momentum 相同（窗口收益），差异在**选择方向**：
+    排序时取**最小**（近期跌得最惨的股票，赌其反转回升）——A 股文献一致
+    认为 1 周~1 月的短期反转显著强于中期动量（见 docs/optimization-log.md
+    第 11 章调研来源）。
+    """
+    return factor_momentum(close, t, lookback, skip, min_bars)
+
+
 def factor_volatility(close: np.ndarray, t: int, window: int,
                       min_bars: int) -> np.ndarray:
     """波动率因子：个股**自身**最近 window 个交易日（跳过停牌日）的
@@ -548,6 +565,10 @@ def run_backtest(
                 vals = factor_momentum(close_np, t, args.mom_lookback,
                                        args.mom_skip, args.min_bars)
                 selected = select_top(vals, args.top_n, direction=+1)
+            elif factor_name == "reversal":
+                vals = factor_reversal(close_np, t, args.rev_lookback,
+                                       args.rev_skip, args.min_bars)
+                selected = select_top(vals, args.top_n, direction=-1)
             else:
                 vals = factor_volatility(close_np, t, args.vol_window,
                                          args.min_bars)
@@ -692,7 +713,8 @@ def run_backtest(
 # 输出
 # ---------------------------------------------------------------------------
 
-FACTOR_LABELS = {"momentum": "动量 Top-N", "volatility": "低波动 Top-N"}
+FACTOR_LABELS = {"momentum": "动量 Top-N", "volatility": "低波动 Top-N",
+                 "reversal": "短期反转 Top-N"}
 
 
 def write_outputs(out: dict, args: argparse.Namespace) -> None:
@@ -744,10 +766,17 @@ def write_outputs(out: dict, args: argparse.Namespace) -> None:
          "trade_days": np.nan, "n_holdings_mean": np.nan},
     ]
     summary = pd.DataFrame(metrics_rows)
-    curves.to_csv(outdir / "equity_curves.csv", index=False,
-                  encoding="utf-8-sig")
-    summary.to_csv(outdir / "summary_screener.csv", index=False,
-                   encoding="utf-8-sig")
+    # 默认动量+低波动组合沿用历史文件名（第 8/9 章引用），其余因子组合
+    # 用内容化文件名，避免覆盖旧章节引用的输出。
+    if sorted(args.factors) == ["momentum", "volatility"]:
+        curves_path = outdir / "equity_curves.csv"
+        summary_path = outdir / "summary_screener.csv"
+    else:
+        suffix = "_".join(args.factors)
+        curves_path = outdir / f"equity_curves_{suffix}.csv"
+        summary_path = outdir / f"summary_screener_{suffix}.csv"
+    curves.to_csv(curves_path, index=False, encoding="utf-8-sig")
+    summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
 
     table: dict[str, dict[str, str]] = {}
     for row in metrics_rows:
@@ -777,7 +806,8 @@ def plot_compare(curves: pd.DataFrame, dates: pd.DatetimeIndex,
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True,
                                    gridspec_kw={"height_ratios": [3, 1]})
-    colors = {"momentum": "tab:blue", "volatility": "tab:red"}
+    colors = {"momentum": "tab:blue", "volatility": "tab:red",
+              "reversal": "tab:purple"}
     for factor_name in args.factors:
         nav = curves[f"{factor_name}_nav"]
         ax1.plot(dates, nav, lw=1.4, color=colors[factor_name],
@@ -797,7 +827,13 @@ def plot_compare(curves: pd.DataFrame, dates: pd.DatetimeIndex,
     ax2.grid(alpha=0.3)
     fig.text(0.5, 0.01, DISCLAIMER, ha="center", fontsize=9, color="gray")
     fig.tight_layout(rect=(0, 0.035, 1, 1))
-    out_png = Path(args.outdir) / "screener_compare.png"
+    # 默认动量+低波动组合沿用历史文件名（第 8/9 章引用），其余因子组合
+    # 用内容化文件名，避免覆盖旧章节引用的图。
+    if sorted(args.factors) == ["momentum", "volatility"]:
+        png_name = "screener_compare.png"
+    else:
+        png_name = "screener_compare_" + "_".join(args.factors) + ".png"
+    out_png = Path(args.outdir) / png_name
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
     print(f"[ok] 对比图已保存: {out_png}")
@@ -846,6 +882,24 @@ def self_test() -> None:
     assert np.isnan(mom[5]), "上市不满 min_bars 的股票不应参与排序"
     top2 = select_top(mom, 2, direction=+1)
     assert sorted(top2) == [0, 1], f"动量 Top-2 应为 [0,1]，实际 {top2}"
+
+    # 1b) 短期反转因子：与动量同口径窗口收益、方向相反——因子值必须等于
+    #     t-skip / t-lookback - 1；反转 Top-2 应含窗口收益最小者，且不得
+    #     选中上涨股 A0/A1（方向错误时会把"涨最多的"买进来）
+    rev = factor_reversal(close_df, 250, lookback=21, skip=5, min_bars=250)
+    expect_rev = close_df[250 - 5] / close_df[250 - 21] - 1.0
+    valid_rev = ~np.isnan(close_df[245]) & ~np.isnan(close_df[229])
+    expect_rev[~valid_rev] = np.nan
+    expect_rev[np.sum(~np.isnan(close_df[:251]), axis=0) < 250] = np.nan
+    assert np.allclose(rev, expect_rev, equal_nan=True), \
+        f"反转因子应等于 21/5 窗口收益: {rev} vs {expect_rev}"
+    assert rev[4] < rev[0] and rev[4] < rev[1], \
+        f"下行股 C0 的窗口收益应低于上涨股: {rev}"
+    assert np.isnan(rev[5]), "上市不满 min_bars 的股票不应参与反转排序"
+    rev_top2 = select_top(rev, 2, direction=-1)
+    assert int(np.nanargmin(rev)) in rev_top2, \
+        f"反转 Top-2 应包含窗口收益最小者，实际 {rev_top2}"
+    assert not set(rev_top2) & {0, 1}, f"反转不应选中上涨股: {rev_top2}"
 
     # 2) 波动率因子：震荡股波动率显著更高；D0 在 t=200（仅 51 根）排除
     vol = factor_volatility(close_df, 250, window=60, min_bars=60)
@@ -944,6 +998,24 @@ def self_test() -> None:
     assert out_susp["results"]["volatility"]["equity"][-1] == 10000.0, \
         "停牌导致未建仓时净值应保持为现金"
 
+    # 6e) 短期反转 Top-1：rev(s0)=12/10-1=+0.2、rev(s1)=30/20-1=+0.5
+    #     → 取最小选 s0；03-02 开盘 12.5 全仓、收盘 13 → 净值 10400（零成本）
+    mini_rev = argparse.Namespace(
+        start="2020-01-31", end="2020-03-02", capital=10000.0,
+        commission=0.0, stamp=0.0, factors=["reversal"],
+        mom_lookback=250, mom_skip=21, rev_lookback=2, rev_skip=0,
+        vol_window=60, min_bars=2, top_n=1)
+    out_rev = run_backtest(d2, c2, o2, ["s0", "s1"], mini_rev, bench)
+    expected_rev = 10000.0 / 12.5 * 13.0
+    got_rev = out_rev["results"]["reversal"]["equity"][-1]
+    assert abs(got_rev - expected_rev) < 0.01, \
+        f"反转迷你回测 {got_rev} 与手算 {expected_rev} 不符"
+    assert out_rev["results"]["reversal"]["holdings"]["symbols"].iloc[1] \
+        == "s0", "反转 Top-1 应选 s0（窗口收益最小者）"
+    eq_rev = out_rev["results"]["reversal"]["equity"]
+    assert eq_rev[1] == 10000.0 and eq_rev[2] == 10000.0, \
+        f"执行日前的净值应为全现金 10000，实际 {eq_rev[1]}, {eq_rev[2]}"
+
     print("[ok] self_test 通过：因子计算、无未来函数、停牌填充、月末识别、"
           "迷你回测、成本口径与停牌执行日断言全部成立")
 
@@ -994,14 +1066,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                       help=f"回测结束日期 YYYYMMDD，默认 {BACKTEST_END_DEFAULT}")
     p_bt.add_argument("--factor", default="momentum,volatility",
                       help="因子，逗号分隔: momentum（动量，选最大）、"
+                           "reversal（短期反转，选最小=近期跌最多）、"
                            "volatility（波动率，选最小=低波动）；"
-                           "默认两者都跑")
+                           "默认 momentum,volatility")
     p_bt.add_argument("--top-n", type=int, default=50,
                       help="每月选入组合的股票数 Top-N，默认 50")
     p_bt.add_argument("--mom-lookback", type=int, default=250,
                       help="动量回看窗口（交易日），默认 250（约 1 年）")
     p_bt.add_argument("--mom-skip", type=int, default=21,
                       help="动量跳过的最近交易日数，默认 21（J-T 12-1 口径）")
+    p_bt.add_argument("--rev-lookback", type=int, default=21,
+                      help="短期反转回看窗口（交易日），默认 21（约 1 个月）")
+    p_bt.add_argument("--rev-skip", type=int, default=5,
+                      help="短期反转跳过的最近交易日数，默认 5（约 1 周，"
+                           "避免 bid-ask bounce）")
     p_bt.add_argument("--vol-window", type=int, default=60,
                       help="波动率估计窗口（个股自身交易日），默认 60")
     p_bt.add_argument("--min-bars", type=int, default=None,
@@ -1033,7 +1111,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         factors = [f.strip() for f in args.factor.split(",") if f.strip()]
         bad = [f for f in factors if f not in FACTOR_LABELS]
         if bad:
-            parser.error(f"未知因子 {bad}，可选: momentum, volatility")
+            parser.error(f"未知因子 {bad}，可选: momentum, reversal, volatility")
         args.factors = factors
         if args.min_bars is None:
             args.min_bars = max(args.mom_lookback, args.vol_window)

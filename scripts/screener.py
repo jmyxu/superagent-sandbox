@@ -490,6 +490,7 @@ def run_backtest(
     symbols: list[str],
     args: argparse.Namespace,
     benchmark: pd.DataFrame,
+    names: dict[str, str] | None = None,
 ) -> dict:
     """月度因子排序 → Top-N 等权组合回测。
 
@@ -531,12 +532,18 @@ def run_backtest(
         turnover = np.zeros(n_ev)
         trade_days = 0
         holdings: list[dict] = []
+        latest: list[dict] = []
+        next_fill = 1  # 下一个待填充净值的评估段下标
 
         for t in reb_idx:
             k = t + 1  # 执行日在并集日历中的下一交易日
             if k >= n:
                 break  # 月末是最后一天，无 t+1 可执行
             k_ev = k - eval_start
+            # 上一次调仓以来、本次执行日之前的每日净值：按当前持仓收盘估值
+            for kk_ev in range(next_fill, k_ev):
+                kk = eval_start + kk_ev
+                equity[kk_ev] = cash + float(np.nansum(shares * close_np[kk]))
             if factor_name == "momentum":
                 vals = factor_momentum(close_np, t, args.mom_lookback,
                                        args.mom_skip, args.min_bars)
@@ -548,12 +555,18 @@ def run_backtest(
             t_open = open_np[k]  # 原始开盘价：NaN=停牌/未上市，不可交易
             tradable = [j for j in selected
                         if not np.isnan(t_open[j]) and t_open[j] > 0]
+            latest = [{
+                "股票代码": symbols[j],
+                "股票名称": (names or {}).get(symbols[j], ""),
+            } for j in tradable]  # 因子排序顺序 = 入选顺序
             holdings.append({
                 "date": dates_ev[k_ev - 1].strftime("%Y-%m-%d"),
                 "n_holdings": len(tradable),
                 "symbols": " ".join(symbols[j] for j in sorted(tradable)),
             })
             if not tradable:
+                equity[k_ev] = cash + float(np.nansum(shares * close_np[k]))
+                next_fill = k_ev + 1
                 continue
 
             # 交易前净值：可交易股票按开盘价、停牌持仓按上一收盘价估值
@@ -593,10 +606,12 @@ def run_backtest(
                     trades_value += sell_value
 
             turnover[k_ev] = 0.5 * trades_value / nav_before
-
-        for k_ev in range(1, n_ev):
-            k = eval_start + k_ev
             equity[k_ev] = cash + float(np.nansum(shares * close_np[k]))
+            next_fill = k_ev + 1
+
+        for kk_ev in range(next_fill, n_ev):
+            kk = eval_start + kk_ev
+            equity[kk_ev] = cash + float(np.nansum(shares * close_np[kk]))
         equity = pd.Series(equity).ffill().to_numpy()
         return {
             "equity": equity,
@@ -605,6 +620,7 @@ def run_backtest(
             "holdings": pd.DataFrame(holdings),
             "n_holdings_mean": float(np.mean(
                 [h["n_holdings"] for h in holdings])) if holdings else np.nan,
+            "latest": latest,
         }
 
     results: dict[str, dict] = {}
@@ -617,17 +633,23 @@ def run_backtest(
     shares = np.zeros(m)
     ew_equity = np.full(n_ev, np.nan)
     ew_equity[0] = capital
+    next_fill = 1
     for t in reb_idx:
         k = t + 1
         if k >= n:
             break
         k_ev = k - eval_start
+        for kk_ev in range(next_fill, k_ev):
+            kk = eval_start + kk_ev
+            ew_equity[kk_ev] = cash + float(np.nansum(shares * close_np[kk]))
         t_open = open_np[k]
         t_close = close_np[t]
         tradable = [j for j in range(m)
                     if not np.isnan(t_open[j]) and not np.isnan(t_close[j])
                     and t_open[j] > 0]
         if not tradable:
+            ew_equity[k_ev] = cash + float(np.nansum(shares * close_np[k]))
+            next_fill = k_ev + 1
             continue
         eff_open = np.where(np.isnan(t_open), close_np[t], t_open)
         nav_before = cash + float(np.nansum(shares * eff_open))
@@ -651,9 +673,11 @@ def run_backtest(
                 sell_value = -delta
                 cash += sell_value - sell_value * (args.commission + args.stamp)
                 shares[j] -= sell_value / t_open[j]
-    for k_ev in range(1, n_ev):
-        k = eval_start + k_ev
         ew_equity[k_ev] = cash + float(np.nansum(shares * close_np[k]))
+        next_fill = k_ev + 1
+    for kk_ev in range(next_fill, n_ev):
+        kk = eval_start + kk_ev
+        ew_equity[kk_ev] = cash + float(np.nansum(shares * close_np[kk]))
     ew_equity = pd.Series(ew_equity).ffill().to_numpy()
 
     return {
@@ -693,6 +717,17 @@ def write_outputs(out: dict, args: argparse.Namespace) -> None:
             res["holdings"].to_csv(
                 outdir / f"holdings_{factor_name}.csv",
                 index=False, encoding="utf-8-sig")
+        latest = res.get("latest")
+        if latest:
+            pd.DataFrame(latest, columns=["股票代码", "股票名称"]).to_csv(
+                outdir / f"latest_picks_{factor_name}.csv",
+                index=False, encoding="utf-8-sig")
+            print(f"\n最新一期 {label}（{len(latest)} 只，按因子排序）:")
+            for i, row in enumerate(latest[:20], 1):
+                print(f"  {i:>2}. {row['股票代码']} {row['股票名称']}")
+            if len(latest) > 20:
+                print(f"  … 共 {len(latest)} 只，完整清单见 "
+                      f"{outdir / f'latest_picks_{factor_name}.csv'}")
 
     m_ew = compute_metrics(out["ew_pool"], 0)
     m_bench = compute_metrics(out["bench"], 0)
@@ -864,6 +899,11 @@ def self_test() -> None:
         f"动量迷你回测 {got_mom} 与手算 {expected_mom} 不符"
     assert out_mom["results"]["momentum"]["holdings"]["symbols"].iloc[1] \
         == "s1", "动量 Top-1 应选 s1"
+    # 6a') 执行日（2020-03-02）之前的每日净值应保持全现金：期末持仓
+    # 不得回代到历史日期估值（曾有此缺陷，2026-11 修复后由本断言守护）
+    eq_mom = out_mom["results"]["momentum"]["equity"]
+    assert eq_mom[1] == 10000.0 and eq_mom[2] == 10000.0, \
+        f"执行日前的净值应为全现金 10000，实际 {eq_mom[1]}, {eq_mom[2]}"
 
     # 6b) 低波动 Top-1：s0 波动远小于 s1 → 选 s0；开盘 12.5 全仓，
     #     收盘 13 → 净值 = 10000/12.5*13 = 10400（零成本）
@@ -878,6 +918,9 @@ def self_test() -> None:
         f"低波动迷你回测 {got_vol} 与手算 {expected_vol} 不符"
     assert out_vol["results"]["volatility"]["holdings"]["symbols"].iloc[1] \
         == "s0", "低波动 Top-1 应选 s0"
+    eq_vol = out_vol["results"]["volatility"]["equity"]
+    assert eq_vol[1] == 10000.0 and eq_vol[2] == 10000.0, \
+        f"执行日前的净值应为全现金 10000，实际 {eq_vol[1]}, {eq_vol[2]}"
 
     # 6c) 成本口径：佣金万三（单边买入），低波动选 s0：
     #     买入额受现金约束 = 10000/1.0003，股数 = 该值/12.5，
@@ -1086,6 +1129,7 @@ def main(argv: list[str] | None = None) -> int:
         universe = fetch_universe(offline=args.offline,
                                   retries=args.retries)
         symbols = universe["symbol"].tolist()
+        names = dict(zip(universe["symbol"], universe["name"]))
         dates, close, open_ = build_panel(symbols, args.datadir, args.adjust,
                                           PANEL_START, args.end)
         if len(dates) == 0 or close.empty:
@@ -1097,7 +1141,7 @@ def main(argv: list[str] | None = None) -> int:
         bench, bench_source = _load_benchmark_cached(args, "data/daily")
         print(f"[ok] 沪深300基准: {bench_source}，{len(bench)} 行")
 
-        out = run_backtest(dates, close, open_, symbols, args, bench)
+        out = run_backtest(dates, close, open_, symbols, args, bench, names)
         write_outputs(out, args)
         print(f"\n⚠ {DISCLAIMER}")
         return 0

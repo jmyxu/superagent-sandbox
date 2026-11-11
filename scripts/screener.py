@@ -83,6 +83,7 @@ from backtest import (  # noqa: E402
     DISCLAIMER,
     _setup_cjk_font,
     compute_metrics,
+    exchange_prefix,
     load_benchmark,
     standardize_stock,
 )
@@ -259,8 +260,10 @@ def _fetch_one(symbol: str, start: str, end: str, retries: int,
                         if attempt < retries:
                             time.sleep(sleep_between + 2 * attempt)
             else:
-                df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start,
-                                           end_date=end, adjust="qfq")
+                # 腾讯源需要交易所前缀（302132 等新代码裸号会被拒）
+                df = ak.stock_zh_a_hist_tx(symbol=exchange_prefix(symbol),
+                                           start_date=start, end_date=end,
+                                           adjust="qfq")
                 if df is None or df.empty:
                     raise EmptyWindowError(f"{symbol}: {start}~{end} 窗口内"
                                            "无行情（可能为窗口之后上市）")

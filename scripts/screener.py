@@ -182,6 +182,17 @@ def _read_state(state_path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _checkpoint_state(rows: list[dict], state_path: Path) -> None:
+    """把当前拉取状态原子落盘（先写临时文件再替换），供断点续跑使用。
+
+    批量拉取中途进程被杀时，已完成股票的 ok 状态不丢失：
+    重新运行 fetch 会按 (fetch_start, fetch_end) 快照键跳过它们。
+    """
+    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+    pd.DataFrame(rows).to_csv(tmp_path, index=False, encoding="utf-8-sig")
+    tmp_path.replace(state_path)
+
+
 def _csv_covers(csv_path: Path, start_ts: pd.Timestamp,
                 end_ts: pd.Timestamp) -> bool:
     """判断已有 CSV 是否完整覆盖拉取窗口的"末端"（max >= end）。
@@ -266,6 +277,8 @@ def run_fetch(universe: pd.DataFrame, start: str, end: str, datadir: str,
 
     缓存键 = (start, end) 快照：已覆盖窗口的股票直接跳过（断点续跑），
     失败清单记录在 data/screener/fetch_failures.txt，下次运行自动重试。
+    进度状态每 25 只原子落盘到 data/screener/fetch_state.csv：
+    批量任务中途被中断（进程被杀等）后重新运行，已完成股票不重拉。
     """
     if offline:
         raise RuntimeError("fetch 需要联网，不能与 --offline 同时使用")
@@ -331,11 +344,11 @@ def run_fetch(universe: pd.DataFrame, start: str, end: str, datadir: str,
         except EmptyWindowError as exc:
             # 窗口内无行情（窗口之后上市的新股等）：记录为 empty，不算失败
             status, source, n_rows = "empty", "窗口内无行情", 0
-            print(f"[empty] {symbol} {name}: {exc}")
+            print(f"[empty] {symbol} {name}: {exc}", flush=True)
         except Exception as exc:  # noqa: BLE001 单只失败不中断批量任务
             status, source = "failed", "—"
             failed.append((symbol, str(exc)[:120]))
-            print(f"[failed] {symbol} {name}: {exc}", file=sys.stderr)
+            print(f"[failed] {symbol} {name}: {exc}", file=sys.stderr, flush=True)
         rows_out.append({
             "symbol": symbol, "name": name, "index": idx_src,
             "rows": n_rows,
@@ -350,7 +363,9 @@ def run_fetch(universe: pd.DataFrame, start: str, end: str, datadir: str,
             el = time.time() - t_start
             print(f"[进度] {i + 1}/{len(symbols)} 已处理，"
                   f"新拉 {ok}、缓存 {cached}、失败 {len(failed)}，"
-                  f"用时 {el:.0f}s")
+                  f"用时 {el:.0f}s", flush=True)
+            # 断点续跑：每批（25 只）落盘一次状态，进程中断后重跑可跳过已完成
+            _checkpoint_state(rows_out, state_path)
 
     pd.DataFrame(rows_out).to_csv(state_path, index=False, encoding="utf-8-sig")
     if failed:

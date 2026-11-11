@@ -188,9 +188,27 @@ def _checkpoint_state(rows: list[dict], state_path: Path) -> None:
 
     批量拉取中途进程被杀时，已完成股票的 ok 状态不丢失：
     重新运行 fetch 会按 (fetch_start, fetch_end) 快照键跳过它们。
+    与既有状态按 symbol 合并（当前批次的记录覆盖旧行），避免续跑批次
+    的中间检查点把旧状态下尚未轮到处理股票的记录抹掉。
     """
+    fresh = pd.DataFrame(rows)
+    if fresh.empty:
+        return
+    old = _read_state(state_path)
+    if not old.empty:
+        # 只保留同一快照窗口的旧记录（换窗口后旧状态本就应整体作废）
+        window = (str(fresh["fetch_start"].iloc[0]).replace("-", ""),
+                  str(fresh["fetch_end"].iloc[0]).replace("-", ""))
+        old = old[
+            old["fetch_start"].astype(str).str.replace("-", "") == window[0]]
+        old = old[
+            old["fetch_end"].astype(str).str.replace("-", "") == window[1]]
+        combined = pd.concat([old, fresh]).drop_duplicates(
+            "symbol", keep="last").reset_index(drop=True)
+    else:
+        combined = fresh
     tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
-    pd.DataFrame(rows).to_csv(tmp_path, index=False, encoding="utf-8-sig")
+    combined.to_csv(tmp_path, index=False, encoding="utf-8-sig")
     tmp_path.replace(state_path)
 
 

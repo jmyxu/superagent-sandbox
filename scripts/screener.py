@@ -83,6 +83,7 @@ from backtest import (  # noqa: E402
     DISCLAIMER,
     _setup_cjk_font,
     compute_metrics,
+    exchange_prefix,
     load_benchmark,
     standardize_stock,
 )
@@ -182,6 +183,35 @@ def _read_state(state_path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _checkpoint_state(rows: list[dict], state_path: Path) -> None:
+    """把当前拉取状态原子落盘（先写临时文件再替换），供断点续跑使用。
+
+    批量拉取中途进程被杀时，已完成股票的 ok 状态不丢失：
+    重新运行 fetch 会按 (fetch_start, fetch_end) 快照键跳过它们。
+    与既有状态按 symbol 合并（当前批次的记录覆盖旧行），避免续跑批次
+    的中间检查点把旧状态下尚未轮到处理股票的记录抹掉。
+    """
+    fresh = pd.DataFrame(rows)
+    if fresh.empty:
+        return
+    old = _read_state(state_path)
+    if not old.empty:
+        # 只保留同一快照窗口的旧记录（换窗口后旧状态本就应整体作废）
+        window = (str(fresh["fetch_start"].iloc[0]).replace("-", ""),
+                  str(fresh["fetch_end"].iloc[0]).replace("-", ""))
+        old = old[
+            old["fetch_start"].astype(str).str.replace("-", "") == window[0]]
+        old = old[
+            old["fetch_end"].astype(str).str.replace("-", "") == window[1]]
+        combined = pd.concat([old, fresh]).drop_duplicates(
+            "symbol", keep="last").reset_index(drop=True)
+    else:
+        combined = fresh
+    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+    combined.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+    tmp_path.replace(state_path)
+
+
 def _csv_covers(csv_path: Path, start_ts: pd.Timestamp,
                 end_ts: pd.Timestamp) -> bool:
     """判断已有 CSV 是否完整覆盖拉取窗口的"末端"（max >= end）。
@@ -213,46 +243,59 @@ def _state_covers(state_row: pd.Series | None, start: str, end: str) -> bool:
 
 
 def _fetch_one(symbol: str, start: str, end: str, retries: int,
-               sleep_between: float) -> tuple[pd.DataFrame, str]:
-    """单只股票日线：东财源优先，失败退腾讯源；返回 (df, 来源名)。
+               sleep_between: float, prefer: str = "em") \
+        -> tuple[pd.DataFrame, str]:
+    """单只股票日线：按 prefer 指定源优先（em 东财 / tx 腾讯），失败退另一源；
+    返回 (df, 来源名)。
 
     整个 [start, end] 窗口内无任何行情（如窗口之后才上市的新股）时抛
     EmptyWindowError，调用方按"空窗口"记录而非拉取失败。
     """
     import akshare as ak
 
+    order = [("em", "akshare 东财"), ("tx", "akshare 腾讯")]
+    if prefer == "tx":
+        order.reverse()
+
     last_err: Exception | None = None
-    for attempt in range(1, retries + 1):
+    for src, label in order:
         try:
-            df = ak.stock_zh_a_hist(symbol=symbol, period="daily",
-                                    start_date=start, end_date=end,
-                                    adjust="qfq")
-            if df is None or df.empty:
-                raise EmptyWindowError(f"{symbol}: {start}~{end} 窗口内无行情"
-                                       "（可能为窗口之后上市）")
-            return df, "akshare 东财"
+            if src == "em":
+                for attempt in range(1, retries + 1):
+                    try:
+                        df = ak.stock_zh_a_hist(symbol=symbol, period="daily",
+                                                start_date=start, end_date=end,
+                                                adjust="qfq")
+                        if df is None or df.empty:
+                            raise EmptyWindowError(
+                                f"{symbol}: {start}~{end} 窗口内无行情"
+                                "（可能为窗口之后上市）")
+                        return df, label
+                    except EmptyWindowError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        last_err = exc
+                        if attempt < retries:
+                            time.sleep(sleep_between + 2 * attempt)
+            else:
+                # 腾讯源需要交易所前缀（302132 等新代码裸号会被拒）
+                df = ak.stock_zh_a_hist_tx(symbol=exchange_prefix(symbol),
+                                           start_date=start, end_date=end,
+                                           adjust="qfq")
+                if df is None or df.empty:
+                    raise EmptyWindowError(f"{symbol}: {start}~{end} 窗口内"
+                                           "无行情（可能为窗口之后上市）")
+                df = df.rename(columns={"date": "日期", "open": "开盘",
+                                        "close": "收盘", "high": "最高",
+                                        "low": "最低", "amount": "成交量"})
+                return df, label + "（优先源）" if prefer == "tx" else \
+                    label + "（东财失败后回退）"
         except EmptyWindowError:
             raise
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-            if attempt < retries:
-                time.sleep(sleep_between + 2 * attempt)
-    try:
-        df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start,
-                                   end_date=end, adjust="qfq")
-        if df is None or df.empty:
-            raise EmptyWindowError(f"{symbol}: {start}~{end} 窗口内无行情"
-                                   "（可能为窗口之后上市）")
-        df = df.rename(columns={"date": "日期", "open": "开盘", "close": "收盘",
-                                "high": "最高", "low": "最低",
-                                "amount": "成交量"})
-        return df, "akshare 腾讯（东财失败后回退）"
-    except EmptyWindowError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            f"东财重试 {retries} 次失败（{last_err}），腾讯回退也失败: {exc}"
-        ) from exc
+    raise RuntimeError(
+        f"东财与腾讯源均失败（最后一次错误: {last_err}）") from last_err
 
 
 class EmptyWindowError(ValueError):
@@ -261,11 +304,13 @@ class EmptyWindowError(ValueError):
 
 def run_fetch(universe: pd.DataFrame, start: str, end: str, datadir: str,
               sleep_between: float, retries: int, max_stocks: int | None,
-              offline: bool) -> int:
+              offline: bool, prefer: str = "em") -> int:
     """分批限速拉取股票池日线，增量缓存 + 断点续跑。
 
     缓存键 = (start, end) 快照：已覆盖窗口的股票直接跳过（断点续跑），
     失败清单记录在 data/screener/fetch_failures.txt，下次运行自动重试。
+    进度状态每 25 只原子落盘到 data/screener/fetch_state.csv：
+    批量任务中途被中断（进程被杀等）后重新运行，已完成股票不重拉。
     """
     if offline:
         raise RuntimeError("fetch 需要联网，不能与 --offline 同时使用")
@@ -312,7 +357,7 @@ def run_fetch(universe: pd.DataFrame, start: str, end: str, datadir: str,
                     status, source, n_rows = "empty", "窗口内无行情", 0
                 else:
                     df, source = _fetch_one(symbol, start, end, retries,
-                                            sleep_between)
+                                            sleep_between, prefer)
                     df = df.reindex(columns=OUT_COLS)  # 缺列补 NaN
                     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
                     ok += 1
@@ -321,7 +366,7 @@ def run_fetch(universe: pd.DataFrame, start: str, end: str, datadir: str,
                     n_rows = len(df)
             else:
                 df, source = _fetch_one(symbol, start, end, retries,
-                                        sleep_between)
+                                        sleep_between, prefer)
                 df = df.reindex(columns=OUT_COLS)  # 缺列补 NaN
                 df.to_csv(csv_path, index=False, encoding="utf-8-sig")
                 ok += 1
@@ -331,11 +376,11 @@ def run_fetch(universe: pd.DataFrame, start: str, end: str, datadir: str,
         except EmptyWindowError as exc:
             # 窗口内无行情（窗口之后上市的新股等）：记录为 empty，不算失败
             status, source, n_rows = "empty", "窗口内无行情", 0
-            print(f"[empty] {symbol} {name}: {exc}")
+            print(f"[empty] {symbol} {name}: {exc}", flush=True)
         except Exception as exc:  # noqa: BLE001 单只失败不中断批量任务
             status, source = "failed", "—"
             failed.append((symbol, str(exc)[:120]))
-            print(f"[failed] {symbol} {name}: {exc}", file=sys.stderr)
+            print(f"[failed] {symbol} {name}: {exc}", file=sys.stderr, flush=True)
         rows_out.append({
             "symbol": symbol, "name": name, "index": idx_src,
             "rows": n_rows,
@@ -350,7 +395,9 @@ def run_fetch(universe: pd.DataFrame, start: str, end: str, datadir: str,
             el = time.time() - t_start
             print(f"[进度] {i + 1}/{len(symbols)} 已处理，"
                   f"新拉 {ok}、缓存 {cached}、失败 {len(failed)}，"
-                  f"用时 {el:.0f}s")
+                  f"用时 {el:.0f}s", flush=True)
+            # 断点续跑：每批（25 只）落盘一次状态，进程中断后重跑可跳过已完成
+            _checkpoint_state(rows_out, state_path)
 
     pd.DataFrame(rows_out).to_csv(state_path, index=False, encoding="utf-8-sig")
     if failed:
@@ -1055,6 +1102,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_fetch.add_argument("--max-stocks", type=int, default=None,
                          help="只处理前 N 只（调试/上游限流时分批用，"
                               "续跑自动跳过已完成）")
+    p_fetch.add_argument("--prefer", choices=["em", "tx"], default="em",
+                         help="数据源优先：em 东财（默认，失败退腾讯）/ "
+                              "tx 腾讯（东财 IP 限流等时段用，失败退东财）")
 
     sub.add_parser("status", help="查看拉取进度与失败清单")
 
@@ -1201,7 +1251,8 @@ def main(argv: list[str] | None = None) -> int:
             universe = fetch_universe(offline=False)
             return run_fetch(universe, args.fetch_start, args.fetch_end,
                              "data/daily", args.sleep, args.retries,
-                             args.max_stocks, offline=False)
+                             args.max_stocks, offline=False,
+                             prefer=args.prefer)
 
         # backtest
         universe = fetch_universe(offline=args.offline,

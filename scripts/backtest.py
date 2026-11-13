@@ -170,7 +170,13 @@ def build_strategy(args: argparse.Namespace) -> Strategy:
 # ---------------------------------------------------------------------------
 
 def standardize_stock(df: pd.DataFrame) -> pd.DataFrame:
-    """把 akshare 返回的日线（中文列名）归一为 date/open/close 三列，去重排序。"""
+    """把 akshare 返回的日线（中文列名）归一为 date/open/close 三列，去重排序。
+
+    数据卫生：上游源对长期停牌股可能返回非正价格（如腾讯 qfq 源在 2019-2020
+    停牌段的复权伪影，实测 000408/000708 出现负数价格）。非正价格没有任何经济
+    含义，且会让引擎计算出负股数/负净值——剔除该行并告警；停牌期本就没有
+    真实成交，剔除不损失有效信息。
+    """
     rename = {}
     for src, dst in (("日期", "date"), ("开盘", "open"), ("收盘", "close")):
         if src in df.columns:
@@ -185,6 +191,11 @@ def standardize_stock(df: pd.DataFrame) -> pd.DataFrame:
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     df = df.dropna(subset=["date", "open", "close"])
     df = df.drop_duplicates(subset="date", keep="last").sort_values("date")
+    non_positive = (df["open"] <= 0) | (df["close"] <= 0)
+    if non_positive.any():
+        print(f"[warn] 剔除 {int(non_positive.sum())} 行非正价格数据（长期停牌的复权伪影）",
+              file=sys.stderr)
+        df = df[~non_positive]
     return df.reset_index(drop=True)
 
 

@@ -1,6 +1,12 @@
 """横截面选股研究（量化学习项目第 6 步）。
 
-以沪深300 + 中证500 成分股为股票池（约 800 只，全市场留作后续扩展），
+股票池两档（--pool 选择）：
+  - cs800（默认）：沪深300 + 中证500 成分股（约 800 只），经 akshare 拉取；
+  - full_a：全 A 市场（约 5900 只，含沪深北交易所），成分清单与 7 年日 K
+    优先复用本机 TSP 平台已落盘的 parquet（D:\\tsp-data\\instruments 与
+    D:\\tsp-data\\kline_daily，--source tsp），无需重新拉网络数据；TSP 数据
+    缺失时回退 akshare 全市场清单 + 分批限速拉取（--source em/tx）。
+
 用 akshare 分批限速拉取 qfq 日线（增量缓存 + 断点续跑），计算**动量**、
 **短期反转**与**波动率**因子，按月排序选出 Top-N 组合并回测，与沪深300
 对比。
@@ -11,6 +17,9 @@
 
     # 1) 拉取成分股 + 分批限速拉取日线（增量缓存 + 断点续跑）
     python scripts/screener.py fetch
+
+    # 1') 全 A 股票池 + 本地 TSP parquet 导入（无需网络）
+    python scripts/screener.py fetch --pool full_a --source tsp
 
     # 查看拉取进度 / 失败清单
     python scripts/screener.py status
@@ -23,7 +32,7 @@
      填充（只在该股票自身数据范围内）；调仓日若目标股票 t+1 无开盘价
      （停牌/未上市），跳过该股、份额留现金，持仓中停牌的股票冻结到下
      次调仓。
-  2. **退市/成分变动（幸存者偏差）**：本步股票池取**当前**成分股快照，
+  2. **退市/成分变动（幸存者偏差）**：股票池取**当前**快照，
      回测区间内退市或被剔除的股票不在池内——回测天然存在幸存者偏差，
      只能如实声明并留待"历史成分股"数据补齐（见日志第 8 章）。
   3. **新股**：上市日晚于因子回看窗口的股票因子为 NaN，自动排除出排序，
@@ -37,6 +46,11 @@
   6. **qfq 历史价可为 0/负数**：大额分红股的前复权早期价格可能 ≤0
      （如 300750 上市头两日 qfq 收盘 -2.09/-0.08）——价格 ≤0 的行按缺失
      处理（收盘前向填充、开盘保持 NaN 不可成交），因子计算要求价格 >0。
+  7. **TSP 日 K 的覆盖与采集缺口**：parquet 自 2019-07-19 起至 2026-07-13
+      完整（约 7 年），2026-07-14 起采集中断（每日仅 1 行），2026-11-06/09
+      恢复后再次中断。导入只采用当日行数 ≥1000 的完整交易日分区（剔除采集
+      中断产生的坏分区）；full_a 池的热身数据因此晚于 akshare 口径（2018 年
+      起），动量 12-1 因子在 2020 年初有约半年的 NaN 期，如实声明。
 
 执行口径（与第 3/5 步引擎一致处沿用）：
   - t 日收盘后按因子排序产生目标组合 → t+1 日开盘价成交（无未来函数）；
@@ -88,8 +102,13 @@ from backtest import (  # noqa: E402
     standardize_stock,
 )
 
-# 沪深300 + 中证500（两指数成分互不重叠）
+# 沪深300 + 中证500（两指数成分互不重叠）；全 A 池见 --pool full_a
 POOL_INDEXES = ["000300", "000905"]
+
+# 本机 TSP 平台已落盘数据目录（全 A 池优先复用，--tsp-dir 可覆盖）
+TSP_DIR_DEFAULT = r"D:\tsp-data"
+# TSP 日 K 分区导入的最低当日行数：低于此值视为采集中断产生的坏分区
+TSP_MIN_DAY_ROWS = 1000
 
 FETCH_START_DEFAULT = "20180101"  # 因子热身：12-1 动量需要 250+21 个交易日
 FETCH_END_DEFAULT = "20251231"  # 与第 2~5 步统一窗口（项目约定）
@@ -111,12 +130,101 @@ OUT_COLS = ["日期", "股票代码", "开盘", "收盘", "最高", "最低", "�
 # 股票池（成分股）
 # ---------------------------------------------------------------------------
 
-def fetch_universe(offline: bool = False, retries: int = 3) -> pd.DataFrame:
-    """拉取沪深300+中证500 当前成分股并缓存（按拉取日期快照）。
+def _read_instruments_parquet(tsp_dir: str) -> pd.DataFrame:
+    """读本机 TSP 平台 instruments 快照（全 A 市场清单），返回标准化列。
 
-    返回 DataFrame：symbol / name / index（来源指数）/ as_of。
+    需要 pyarrow（pip install pyarrow）。TSP 数据缺失时报错并提示改用
+    akshare 全市场清单（见 fetch_universe_full_a 的回退路径）。
+    """
+    inst_path = Path(tsp_dir) / "instruments" / "instruments.parquet"
+    if not inst_path.exists():
+        raise RuntimeError(
+            f"未找到 TSP instruments 快照 {inst_path}（--tsp-dir 可覆盖目录），"
+            "请确认本机 TSP 数据目录或改用 akshare 全市场清单")
+    try:
+        import pyarrow.parquet as pq  # noqa: PLC0415 局部导入，仅此路径需要
+    except ImportError as exc:
+        raise RuntimeError(
+            "读取 TSP parquet 需要 pyarrow，请先执行: pip install pyarrow") from exc
+    raw = pq.read_table(inst_path).to_pandas()
+    if "type" in raw.columns:
+        raw = raw[raw["type"] == "stock"]
+    if raw.empty:
+        raise RuntimeError(f"TSP instruments 快照为空: {inst_path}")
+    df = pd.DataFrame({
+        "symbol": raw["code"].astype(str).str.zfill(6),
+        "name": raw["name"],
+        "index": "full_a",
+    })
+    if "exchange" in raw.columns:
+        df["exchange"] = raw["exchange"].astype(str)
+    if "listing_date" in raw.columns:
+        df["listing_date"] = raw["listing_date"].astype(str)
+    df = df.drop_duplicates("symbol").sort_values("symbol").reset_index(drop=True)
+    as_of = "unknown"
+    if "as_of" in raw.columns and len(raw):
+        as_of = str(pd.Series(raw["as_of"]).dropna().iloc[0])[:10].replace("-", "")
+    df["as_of"] = as_of
+    return df
+
+
+def fetch_universe_full_a(tsp_dir: str = TSP_DIR_DEFAULT,
+                          offline: bool = False) -> pd.DataFrame:
+    """全 A 股票池（约 5900 只，含沪深北交易所）并缓存。
+
+    优先复用本机 TSP 已落盘的 instruments 快照（无需网络）；TSP 数据缺失
+    且非 offline 时回退 akshare 全市场清单（ak.stock_info_a_code_name）。
+    返回 DataFrame：symbol / name / index / as_of。
+    """
+    fdir = Path(FACTOR_DIR)
+    fdir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        df = _read_instruments_parquet(tsp_dir)
+        source = f"TSP instruments 快照（{tsp_dir}）"
+    except RuntimeError as tsp_err:
+        if offline:
+            candidates = sorted(fdir.glob("universe_full_a_*.csv"))
+            if candidates:
+                df = pd.read_csv(candidates[-1], dtype={"symbol": str})
+                print(f"[warn] TSP 快照不可用（{tsp_err}），offline 模式复用"
+                      f"缓存 {candidates[-1].name}")
+                return df
+            raise
+        print(f"[warn] TSP 快照不可用（{tsp_err}），回退 akshare 全市场清单",
+              file=sys.stderr)
+        import akshare as ak
+        raw = ak.stock_info_a_code_name()
+        if raw is None or raw.empty:
+            raise RuntimeError("TSP 快照与 akshare 全市场清单均不可用") from tsp_err
+        df = pd.DataFrame({
+            "symbol": raw["code"].astype(str).str.zfill(6),
+            "name": raw["name"],
+            "index": "full_a",
+        })
+        df["as_of"] = datetime.now().strftime("%Y%m%d")
+        source = "akshare 全市场清单（TSP 快照不可用）"
+
+    cache_path = fdir / f"universe_full_a_{df['as_of'].iloc[0]}.csv"
+    if not cache_path.exists():
+        df.to_csv(cache_path, index=False, encoding="utf-8-sig")
+    print(f"[ok] 股票池: 全 A 市场 {len(df)} 只（{source}，快照 "
+          f"{df['as_of'].iloc[0]}，缓存 {cache_path}）")
+    return df
+
+
+def fetch_universe(offline: bool = False, retries: int = 3,
+                   pool: str = "cs800",
+                   tsp_dir: str = TSP_DIR_DEFAULT) -> pd.DataFrame:
+    """拉取股票池并缓存（按快照日期）。
+
+    pool="cs800"（默认）拉取沪深300+中证500 当前成分股（akshare，按拉取
+    日期快照）；pool="full_a" 见 fetch_universe_full_a。
+    返回 DataFrame：symbol / name / index（来源指数或 full_a）/ as_of。
     同一天重复运行直接复用缓存；offline 模式只用本地缓存。
     """
+    if pool == "full_a":
+        return fetch_universe_full_a(tsp_dir=tsp_dir, offline=offline)
     import akshare as ak
 
     fdir = Path(FACTOR_DIR)
@@ -302,16 +410,248 @@ class EmptyWindowError(ValueError):
     """拉取窗口内无任何行情（新股在窗口之后上市等），非传输失败。"""
 
 
+# ---------------------------------------------------------------------------
+# 全 A 池的 TSP parquet 导入（无需网络）
+# ---------------------------------------------------------------------------
+
+def _load_tsp_panel(tsp_dir: str, start: str, end: str
+                    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """读本机 TSP kline_daily 分区 parquet → (面板, 复权事件)。
+
+    面板列：symbol（600000.SH 形式）/ code（6 位）/ date / open / high /
+    low / close / volume（手）/ amount。只采用 [start, end] 内当日行数
+    ≥ TSP_MIN_DAY_ROWS 的完整交易日分区（剔除采集中断产生的坏分区）。
+    复权事件来自 adj_factor/all.parquet：symbol / trade_date / ex_factor。
+    """
+    kdir = Path(tsp_dir) / "kline_daily"
+    if not kdir.is_dir():
+        raise RuntimeError(f"未找到 TSP 日 K 目录 {kdir}（--tsp-dir 可覆盖）")
+    try:
+        import pyarrow.parquet as pq  # noqa: PLC0415 局部导入，仅此路径需要
+    except ImportError as exc:
+        raise RuntimeError(
+            "读取 TSP parquet 需要 pyarrow，请先执行: pip install pyarrow") from exc
+
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    frames: list[pd.DataFrame] = []
+    n_bad = 0
+    for part_dir in sorted(p for p in kdir.iterdir() if p.is_dir()):
+        try:
+            day = pd.Timestamp(part_dir.name.split("=")[1])
+        except (IndexError, ValueError):
+            continue
+        if day < start_ts or day > end_ts:
+            continue
+        files = list(part_dir.glob("*.parquet"))
+        if not files:
+            continue
+        total = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
+        if total < TSP_MIN_DAY_ROWS:
+            n_bad += 1  # 采集中断产生的坏分区（如每日仅 1 行）
+            continue
+        frames.append(pq.read_table(part_dir).to_pandas())
+    if n_bad:
+        print(f"[warn] TSP 日 K: 跳过 {n_bad} 个不完整交易日分区"
+              f"（当日行数 < {TSP_MIN_DAY_ROWS}，采集中断坏分区）", file=sys.stderr)
+    if not frames:
+        return pd.DataFrame(), pd.DataFrame()
+    panel = pd.concat(frames, ignore_index=True)
+    panel["date"] = pd.to_datetime(panel["date"])
+    panel["code"] = panel["symbol"].astype(str).str.split(".").str[0]
+    panel = panel.sort_values(["code", "date"]).reset_index(drop=True)
+
+    events = pd.DataFrame()
+    ev_path = Path(tsp_dir) / "adj_factor" / "all.parquet"
+    if ev_path.exists():
+        ev = pq.read_table(ev_path).to_pandas()
+        ev = ev[["symbol", "trade_date", "ex_factor"]].dropna(
+            subset=["ex_factor"])
+        ev["trade_date"] = pd.to_datetime(ev["trade_date"])
+        events = ev.sort_values("trade_date").reset_index(drop=True)
+    else:
+        print(f"[warn] 未找到 {ev_path}，按不复权导入（含权价，跨除权日收益"
+              f"会混入分红跳空）", file=sys.stderr)
+    return panel, events
+
+
+def _qfq_factors(dates: np.ndarray, ev_dates: np.ndarray,
+                 ev_factors: np.ndarray) -> np.ndarray:
+    """单只股票的前复权累计因子：fac[t] = Π(发生在 date[t] 当日及之前的
+    ex_factor 事件)。原始价 × fac 即 qfq 价（跨除权日收益连续）。"""
+    order = np.argsort(ev_dates)
+    ev_dates, ev_factors = ev_dates[order], ev_factors[order]
+    cum = np.cumprod(ev_factors.astype(float))
+    idx = np.searchsorted(ev_dates, dates, side="right") - 1
+    fac = np.ones(len(dates), dtype=float)
+    m = idx >= 0
+    fac[m] = cum[idx[m]]
+    return fac
+
+
+def _fetch_from_tsp(universe: pd.DataFrame, start: str, end: str,
+                    datadir: str, max_stocks: int | None,
+                    tsp_dir: str) -> int:
+    """从本机 TSP parquet 导入全 A 日线为 data/daily/<代码>_qfq.csv。
+
+    与网络拉取同款状态文件与快照键 (fetch_start, fetch_end)（断点续跑），
+    导入时用 adj_factor 一次性把原始价换算成 qfq 后落盘；换窗口整体重导。
+    输出列与 akshare 拉取完全一致（OUT_COLS），下游 backtest/screener/
+    pool_backtest 无感复用。
+    """
+    outdir = Path(datadir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    fdir = Path(FACTOR_DIR)
+    fdir.mkdir(parents=True, exist_ok=True)
+    state_path = fdir / FETCH_STATE
+    failures_path = fdir / FETCH_FAILURES
+    state = _read_state(state_path)
+    state_idx = ({row["symbol"]: row for _, row in state.iterrows()}
+                 if not state.empty else None)
+
+    panel, events = _load_tsp_panel(tsp_dir, start, end)
+    if panel.empty:
+        raise RuntimeError(
+            f"TSP kline_daily 在 {start}~{end} 内无完整交易日分区（"
+            f"当日行数 ≥ {TSP_MIN_DAY_ROWS}）")
+    eff_start = panel["date"].min().strftime("%Y-%m-%d")
+    eff_end = panel["date"].max().strftime("%Y-%m-%d")
+    print(f"[ok] TSP 日 K 面板: {len(panel)} 行 × {panel['code'].nunique()} 只，"
+          f"覆盖 {eff_start} ~ {eff_end}（请求窗口 {start}~{end}）")
+
+    # 换手率需要流通股本（instruments 快照，缺失则留 NaN）
+    float_shares: dict[str, float] = {}
+    inst_path = Path(tsp_dir) / "instruments" / "instruments.parquet"
+    if inst_path.exists():
+        try:
+            import pyarrow.parquet as pq  # noqa: PLC0415
+            inst_raw = pq.read_table(inst_path).to_pandas()
+            inst_raw["code"] = inst_raw["code"].astype(str).str.zfill(6)
+            float_shares = dict(zip(
+                inst_raw["code"], inst_raw["float_shares"].astype(float)))
+        except Exception:  # noqa: BLE001 换手率是派生列，缺失不影响主流程
+            pass
+
+    by_code: dict[str, pd.DataFrame] = {
+        c: g.drop(columns="symbol").reset_index(drop=True)
+        for c, g in panel.groupby("code", sort=False)}
+    meta = universe.set_index("symbol")
+    ev_by_code: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if not events.empty:
+        events["code"] = events["symbol"].astype(str).str.split(".").str[0]
+        for c, g in events.groupby("code", sort=False):
+            ev_by_code[c] = (g["trade_date"].values, g["ex_factor"].values)
+
+    symbols = universe["symbol"].tolist()
+    if max_stocks:
+        symbols = symbols[:max_stocks]
+
+    failed: list[tuple[str, str]] = []
+    ok = cached = 0
+    t_start = time.time()
+    rows_out: list[dict] = []
+    for i, symbol in enumerate(symbols):
+        csv_path = outdir / f"{symbol}_qfq.csv"
+        status, first, last, source, n_rows = "ok", None, None, "TSP parquet 导入", None
+        try:
+            prev = state_idx.get(symbol) if state_idx else None
+            # 状态复用需同窗口快照键；且来源不得是 akshare（防止两种数据源
+            # 在共享 data/daily 目录里互相误用对方缓存）
+            prev_is_tsp = prev is not None and "akshare" not in str(
+                prev.get("source", ""))
+            if (prev_is_tsp and _state_covers(prev, start, end)
+                    and _csv_covers(csv_path, pd.Timestamp(eff_start),
+                                    pd.Timestamp(eff_end))):
+                df = standardize_stock(pd.read_csv(csv_path))
+                cached += 1
+                first, last, n_rows = (df["date"].iloc[0],
+                                       df["date"].iloc[-1], len(df))
+                status, source = "ok", "本地缓存"
+            else:
+                sub = by_code.get(symbol)
+                if sub is None or sub.empty:
+                    status, source, n_rows = "empty", "窗口内无行情", 0
+                else:
+                    dates = sub["date"].values
+                    if symbol in ev_by_code:
+                        ev_d, ev_f = ev_by_code[symbol]
+                    else:
+                        ev_d = np.array([], dtype="datetime64[ns]")
+                        ev_f = np.array([], dtype=float)
+                    fac = _qfq_factors(dates, ev_d, ev_f)
+                    close = (sub["close"].values * fac).astype(float)
+                    open_ = (sub["open"].values * fac).astype(float)
+                    high = (sub["high"].values * fac).astype(float)
+                    low = (sub["low"].values * fac).astype(float)
+                    volume = sub["volume"].values.astype(float)
+                    prev_close = np.concatenate([[np.nan], close[:-1]])
+                    out = pd.DataFrame({
+                        "日期": sub["date"].dt.strftime("%Y-%m-%d"),
+                        "股票代码": symbol,
+                        "开盘": open_, "收盘": close, "最高": high, "最低": low,
+                        "成交量": volume, "成交额": sub["amount"].values,
+                        "振幅": (high - low) / prev_close * 100.0,
+                        "涨跌幅": (close / prev_close - 1.0) * 100.0,
+                        "涨跌额": close - prev_close,
+                        "换手率": (volume * 10000.0 / float_shares[symbol]
+                                  if symbol in float_shares else np.nan),
+                    })[OUT_COLS]
+                    out.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                    ok += 1
+                    first = sub["date"].iloc[0]
+                    last = sub["date"].iloc[-1]
+                    n_rows = len(sub)
+        except Exception as exc:  # noqa: BLE001 单只失败不中断批量任务
+            status, source = "failed", "—"
+            failed.append((symbol, str(exc)[:120]))
+            print(f"[failed] {symbol}: {exc}", file=sys.stderr, flush=True)
+        row = meta.loc[symbol]
+        rows_out.append({
+            "symbol": symbol, "name": row["name"], "index": row["index"],
+            "rows": n_rows,
+            "first_date": None if first is None else first.strftime("%Y-%m-%d"),
+            "last_date": None if last is None else last.strftime("%Y-%m-%d"),
+            "source": source,
+            "fetch_start": start, "fetch_end": end,
+            "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": status,
+        })
+        if (i + 1) % 100 == 0 or i == len(symbols) - 1:
+            el = time.time() - t_start
+            print(f"[进度] {i + 1}/{len(symbols)} 已处理，"
+                  f"新导 {ok}、缓存 {cached}、失败 {len(failed)}，"
+                  f"用时 {el:.0f}s", flush=True)
+            _checkpoint_state(rows_out, state_path)
+
+    pd.DataFrame(rows_out).to_csv(state_path, index=False, encoding="utf-8-sig")
+    if failed:
+        with failures_path.open("w", encoding="utf-8") as fh:
+            for symbol, err in failed:
+                fh.write(f"{symbol}\t{err}\n")
+        print(f"[warn] 共 {len(symbols)} 只，失败 {len(failed)} 只，清单已写 "
+              f"{failures_path}；重新运行本命令会自动重试失败项",
+              file=sys.stderr)
+        return 1
+    failures_path.unlink(missing_ok=True)
+    print(f"[ok] 全部 {len(symbols)} 只完成：新导 {ok}、缓存 {cached}")
+    return 0
+
+
 def run_fetch(universe: pd.DataFrame, start: str, end: str, datadir: str,
               sleep_between: float, retries: int, max_stocks: int | None,
-              offline: bool, prefer: str = "em") -> int:
+              offline: bool, prefer: str = "em", source: str = "em",
+              tsp_dir: str = TSP_DIR_DEFAULT) -> int:
     """分批限速拉取股票池日线，增量缓存 + 断点续跑。
 
+    source="em"/"tx" 走 akshare 网络拉取；source="tsp" 从本机 TSP parquet
+    导入（无需网络，见 _fetch_from_tsp，qfq 由 adj_factor 换算）。
     缓存键 = (start, end) 快照：已覆盖窗口的股票直接跳过（断点续跑），
     失败清单记录在 data/screener/fetch_failures.txt，下次运行自动重试。
     进度状态每 25 只原子落盘到 data/screener/fetch_state.csv：
     批量任务中途被中断（进程被杀等）后重新运行，已完成股票不重拉。
     """
+    if source == "tsp":
+        return _fetch_from_tsp(universe, start, end, datadir, max_stocks,
+                               tsp_dir)
     if offline:
         raise RuntimeError("fetch 需要联网，不能与 --offline 同时使用")
 
@@ -1105,10 +1445,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_fetch.add_argument("--prefer", choices=["em", "tx"], default="em",
                          help="数据源优先：em 东财（默认，失败退腾讯）/ "
                               "tx 腾讯（东财 IP 限流等时段用，失败退东财）")
+    p_fetch.add_argument("--source", choices=["em", "tx", "tsp"], default="em",
+                         help="数据来源：em/tx 经 akshare 网络拉取（默认 em）；"
+                              "tsp 从本机 TSP parquet 导入（无需网络，"
+                              "qfq 由 adj_factor 换算）")
+    p_fetch.add_argument("--pool", choices=["cs800", "full_a"], default=None,
+                         help="股票池：cs800=沪深300+中证500（默认）；"
+                              "full_a=全 A 市场约 5900 只（source=tsp 时默认）")
+    p_fetch.add_argument("--tsp-dir", default=TSP_DIR_DEFAULT,
+                         help=f"本机 TSP 数据目录，默认 {TSP_DIR_DEFAULT}")
 
     sub.add_parser("status", help="查看拉取进度与失败清单")
 
     p_bt = sub.add_parser("backtest", help="因子计算 + 月度 Top-N 回测")
+    p_bt.add_argument("--pool", choices=["cs800", "full_a"], default=None,
+                      help="股票池：cs800=沪深300+中证500（默认）；"
+                           "full_a=全 A 市场约 5900 只（本地 TSP 快照优先）")
+    p_bt.add_argument("--tsp-dir", default=TSP_DIR_DEFAULT,
+                      help=f"本机 TSP 数据目录（full_a 池），默认 {TSP_DIR_DEFAULT}")
     p_bt.add_argument("--start", default=BACKTEST_START_DEFAULT,
                       help=f"回测开始日期 YYYYMMDD，默认 "
                            f"{BACKTEST_START_DEFAULT}")
@@ -1248,15 +1602,20 @@ def main(argv: list[str] | None = None) -> int:
     socket.setdefaulttimeout(90)  # 上游限流时请求可能很慢，兜底防挂起
     try:
         if command == "fetch":
-            universe = fetch_universe(offline=False)
+            pool = args.pool or ("full_a" if args.source == "tsp" else "cs800")
+            universe = fetch_universe(offline=False, pool=pool,
+                                      tsp_dir=args.tsp_dir)
             return run_fetch(universe, args.fetch_start, args.fetch_end,
                              "data/daily", args.sleep, args.retries,
                              args.max_stocks, offline=False,
-                             prefer=args.prefer)
+                             prefer=args.prefer, source=args.source,
+                             tsp_dir=args.tsp_dir)
 
         # backtest
+        pool = args.pool or "cs800"
         universe = fetch_universe(offline=args.offline,
-                                  retries=args.retries)
+                                  retries=args.retries, pool=pool,
+                                  tsp_dir=args.tsp_dir)
         symbols = universe["symbol"].tolist()
         names = dict(zip(universe["symbol"], universe["name"]))
         dates, close, open_ = build_panel(symbols, args.datadir, args.adjust,

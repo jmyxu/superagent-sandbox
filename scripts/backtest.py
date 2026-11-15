@@ -170,7 +170,11 @@ def build_strategy(args: argparse.Namespace) -> Strategy:
 # ---------------------------------------------------------------------------
 
 def standardize_stock(df: pd.DataFrame) -> pd.DataFrame:
-    """把 akshare 返回的日线（中文列名）归一为 date/open/close 三列，去重排序。
+    """把 akshare 返回的日线（中文列名）归一为 date/open/close 等列，去重排序。
+
+    必需列：date/open/close；可选列（存在则保留，供量价类策略使用）：
+    最高→high、最低→low、成交量→volume、成交额→amount。列名已是英文时
+    原样保留。
 
     数据卫生：上游源对长期停牌股可能返回非正价格（如腾讯 qfq 源在 2019-2020
     停牌段的复权伪影，实测 000408/000708 出现负数价格）。非正价格没有任何经济
@@ -178,17 +182,21 @@ def standardize_stock(df: pd.DataFrame) -> pd.DataFrame:
     真实成交，剔除不损失有效信息。
     """
     rename = {}
-    for src, dst in (("日期", "date"), ("开盘", "open"), ("收盘", "close")):
+    for src, dst in (("日期", "date"), ("开盘", "open"), ("收盘", "close"),
+                     ("最高", "high"), ("最低", "low"), ("成交量", "volume"),
+                     ("成交额", "amount")):
         if src in df.columns:
             rename[src] = dst
     df = df.rename(columns=rename)
     for col in ("date", "open", "close"):
         if col not in df.columns:
             raise ValueError(f"数据缺少列 {col!r}，实际列: {list(df.columns)}")
-    df = df[["date", "open", "close"]].copy()
+    keep = ["date", "open", "close"] + [c for c in ("high", "low", "volume", "amount")
+                                        if c in df.columns]
+    df = df[keep].copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["open"] = pd.to_numeric(df["open"], errors="coerce")
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    for col in keep[1:]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["date", "open", "close"])
     df = df.drop_duplicates(subset="date", keep="last").sort_values("date")
     non_positive = (df["open"] <= 0) | (df["close"] <= 0)

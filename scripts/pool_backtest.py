@@ -2,8 +2,9 @@
 
 动机：三个单股策略（ma_cross / rsi / bollinger）此前只在 4 只事后挑选的
 幸存者标的上回测过（第 3 步口径，样本量不足）。本脚本把同一套统一回测
-引擎（scripts/backtest.py 的仓位边沿成交口径）应用到第 6 步的
-沪深300+中证500 股票池（约 800 只），做全样本扩展回测，并给出横截面
+引擎（scripts/backtest.py 的仓位边沿成交口径）应用到第 6 步的股票池
+（默认沪深300+中证500 约 800 只；--pool full_a 扩展到全 A 市场约 5900 只，
+优先复用本机 TSP parquet，见 screener.py），做全样本扩展回测，并给出横截面
 统计（均值/中位数、跑赢买入持有与沪深300 的比例、配对 t 统计量、符号
 检验）来检验单票结论在全池上是否成立。
 
@@ -16,9 +17,10 @@
 
 用法示例：
   python scripts/pool_backtest.py fetch --prefer tx   # 拉取股票池日线（断点续跑）
+  python scripts/pool_backtest.py fetch --pool full_a --source tsp  # 全 A 池（TSP parquet 导入）
   python scripts/pool_backtest.py status              # 拉取进度/失败清单
   python scripts/pool_backtest.py backtest            # 三策略 × 全池回测（整手+小数股）
-  python scripts/pool_backtest.py backtest --strategies rsi,bollinger --lot-only
+  python scripts/pool_backtest.py backtest --pool full_a --strategies rsi --frac-only
   python scripts/pool_backtest.py selftest            # 合成数据自检（不访问网络）
 
 输出（output/backtest/pool/）：
@@ -66,6 +68,7 @@ from backtest import (  # noqa: E402
 from screener import (  # noqa: E402
     FETCH_END_DEFAULT,
     FETCH_START_DEFAULT,
+    TSP_DIR_DEFAULT,
     _load_benchmark_cached,
     cmd_status,
     fetch_universe,
@@ -114,10 +117,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          help="只处理前 N 只（分批拉取用，续跑自动跳过已完成）")
     p_fetch.add_argument("--prefer", choices=["em", "tx"], default="em",
                          help="数据源优先：em 东财（默认，失败退腾讯）/ tx 腾讯（东财 IP 限流时段用）")
+    p_fetch.add_argument("--source", choices=["em", "tx", "tsp"], default="em",
+                         help="数据来源：em/tx 经 akshare 网络拉取（默认 em）；"
+                              "tsp 从本机 TSP parquet 导入（无需网络）")
+    p_fetch.add_argument("--pool", choices=["cs800", "full_a"], default=None,
+                         help="股票池：cs800=沪深300+中证500（默认）；"
+                              "full_a=全 A 市场约 5900 只（source=tsp 时默认）")
+    p_fetch.add_argument("--tsp-dir", default=TSP_DIR_DEFAULT,
+                         help=f"本机 TSP 数据目录，默认 {TSP_DIR_DEFAULT}")
 
     sub.add_parser("status", help="查看日线拉取进度与失败清单（复用 screener）")
 
     p_bt = sub.add_parser("backtest", help="三策略 × 全池回测 + 横截面统计")
+    p_bt.add_argument("--pool", choices=["cs800", "full_a"], default=None,
+                      help="股票池：cs800=沪深300+中证500（默认）；"
+                           "full_a=全 A 市场约 5900 只（本地 TSP 快照优先）")
+    p_bt.add_argument("--tsp-dir", default=TSP_DIR_DEFAULT,
+                      help=f"本机 TSP 数据目录（full_a 池），默认 {TSP_DIR_DEFAULT}")
     p_bt.add_argument("--start", default=BACKTEST_START_DEFAULT,
                       help=f"回测开始日期 YYYYMMDD，默认 {BACKTEST_START_DEFAULT}")
     p_bt.add_argument("--end", default=BACKTEST_END_DEFAULT,
@@ -402,7 +418,8 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    universe = fetch_universe(offline=args.offline, retries=args.retries)
+    universe = fetch_universe(offline=args.offline, retries=args.retries,
+                              pool=args.pool or "cs800", tsp_dir=args.tsp_dir)
     symbols = universe["symbol"].tolist()
     names = dict(zip(universe["symbol"], universe["name"]))
     index_of = dict(zip(universe["symbol"], universe["index"]))
@@ -642,10 +659,13 @@ def main(argv: list[str] | None = None) -> int:
         old_timeout = socket.getdefaulttimeout()
         socket.setdefaulttimeout(90)  # 上游限流时请求可能很慢，兜底防挂起（与 screener 一致）
         try:
-            universe = fetch_universe(offline=False)
+            pool = args.pool or ("full_a" if args.source == "tsp" else "cs800")
+            universe = fetch_universe(offline=False, pool=pool,
+                                      tsp_dir=args.tsp_dir)
             return run_fetch(universe, args.fetch_start, args.fetch_end,
                              DATADIR_DEFAULT, args.sleep, args.retries,
-                             args.max_stocks, offline=False, prefer=args.prefer)
+                             args.max_stocks, offline=False, prefer=args.prefer,
+                             source=args.source, tsp_dir=args.tsp_dir)
         finally:
             socket.setdefaulttimeout(old_timeout)
     if command == "backtest":

@@ -1894,6 +1894,113 @@
 
 ---
 
+## 17. 全 A 股票池扩展 + n_day_low_reversal 全池 walk-forward 优化（issue #33）
+
+> 任务来源：[GitHub issue #33](https://github.com/jmyxu/superagent-sandbox/issues/33)（JIANGMINGYA，2026-11-15 任务变更）。
+> 新增/改动：`scripts/screener.py`（股票池 `--pool full_a` + 本机 TSP parquet 导入 `--source tsp`）、`scripts/strategies.py`（新低反转策略 `n_day_low_reversal`，TSP 种子移植）、`scripts/pool_walkforward.py`（全池 walk-forward 矩阵引擎）、`scripts/backtest.py`（`standardize_stock` 保留 high/low/volume/amount 供量价策略使用）。
+> **⚠ 免责声明：本节全部内容为历史模拟回测，仅用于学习方法验证；历史模拟回测结果不代表未来表现，不构成投资建议。**
+
+### 17.1 任务与统一口径
+
+任务变更后的两件事：① 把 `screener.py` 的股票池从沪深300+中证500（约 800 只）扩展到全 A 市场（约 5900 只），数据优先复用本机 TSP 已落盘的 7 年日 K parquet，无需重新拉网络数据；② 对 `n_day_low_reversal`（新低反转，TSP 原生引擎全市场唯一正收益策略）做稳健优化：参数网格 + 按年 walk-forward 验证，输出最优参数与样本外表现。
+
+| 项目 | 口径 |
+| --- | --- |
+| 股票池 | 全 A 市场 5892 只（沪深 2469 + 深市 3068 + 北交所 355，TSP instruments 快照 2026-11-13）；回测参与 5706 只（135 只窗口内无行情、51 只 K 线 < 60 根被剔除）；当前快照自带幸存者偏差（同第 16 章声明） |
+| 日线数据 | 本机 TSP parquet 导入（`D:\tsp-data`）：kline_daily 日 K（原始价）+ adj_factor 事件表换算 qfq 前复权，落盘 `data/daily/<代码>_qfq.csv`（与 akshare 拉取同列、同快照键缓存、断点续跑）；覆盖 2019-07-19 ~ 2026-07-13（约 7 年，2026-07-14 起 TSP 采集中断，见 17.2） |
+| 策略移植 | TSP 种子 `n_day_low_reversal`（本机 `D:\tsp-data\strategies\custom\n_day_low_reversal.py`）逐语义移植：入场 = 触及 N 日**收盘**新低 + 收阳 + 量比 ≥ vol_ratio_min（量比 = 当日量 / 前 5 日均量，TSP vol_ratio_5d 同口径）；离场 = 跌破 20 日均线 / 收盘 ≤ 入场参考价 ×(1+stop_loss) / 最长持有到期；入场参考价 = 信号次日开盘 |
+| 回测引擎 | 统一引擎口径：t 日收盘信号 → t+1 日开盘成交（边沿触发）、买入佣金万三 + 卖出印花税万五、小数股全仓（学术口径）、期末强平；全池矩阵引擎与逐票引擎严格等价（selftest 最大绝对误差 4.07e-7，见 17.3） |
+| 参数网格 | 4 维 × 4 档 = 256 组合（含 TSP 默认 60/1.5/-0.06/15）：`n_days`∈{20,40,60,120}、`vol_ratio_min`∈{1.0,1.5,2.0,3.0}、`stop_loss`∈{0,−0.03,−0.06,−0.10}、`max_hold_days`∈{5,10,15,20}；三个入场布尔过滤与离场均线（20 日）固定为 TSP 默认 |
+| walk-forward 折 | 锚定式（与第 4/6 章同款）：fold1 样本内 2020~2022 → 样本外 2023；fold2 样本内 2020~2023 → 样本外 2024；fold3 样本内 2020~2024 → 样本外 2025；fold4 样本内 2020~2025 → 样本外 2026 年（部分年，数据至 2026-07-13） |
+| 评估指标 | 每只股票独立账户（初始 1.0），逐票总收益/年化/最大回撤/交易次数/胜率 → 全池横截面均值；每折按样本内**全池平均总收益**选参，全部组合都在样本外重跑以计算 Spearman ρ（样本内-样本外秩相关）、样本内最优的样本外分位与翻转率（过拟合诊断，与第 6 章同款） |
+
+### 17.2 数据：TSP parquet 导入与 qfq 换算校验
+
+| 项目 | 内容 |
+| --- | --- |
+| 成分清单 | TSP instruments 快照 5892 只（type=stock；`data/screener/universe_full_a_20261113.csv`） |
+| 日 K 面板 | kline_daily 按日分区 parquet：窗口内 8,128,668 行 × 5757 只，2019-07-19 ~ 2026-07-13 完整；跳过 80 个不完整交易日分区（当日行数 < 1000：2026-07-14 起采集中断每日仅 1 行，2026-11-06/09 恢复后再次中断，为 TSP 采集缺口而非交易所缺日） |
+| qfq 换算 | 原始价 × 累计前复权因子，因子 = Π(adj_factor 表中发生在当日及之前的 ex_factor 事件)；42,359 条事件（3616 只有分红/送转），事件前因子取 1（窗口内收益不受影响，与 akshare qfq 只差常数基线） |
+| 换算校验 | ① 000001.SZ 除权日 2023-06-14（ex_factor 1.024972）qfq 涨跌幅 −0.115%（无分红跳空，原始价当日 −2.5%）；② 600519.SH 除权日 2024-06-19 qfq 涨跌幅 −1.35%；③ 与新浪 qfq 源对照（2023-05~07，000001.SZ）：两序列比值标准差 0.036%（常数基线差，2 位小数舍入量级）、日收益最大差 0.07%——换算口径与主流 qfq 源一致 |
+| 导入结果 | 新导 5754 只、复用缓存 3 只、窗口内无行情 135 只、失败 0 只，用时 74s（无网络）；行数中位数 1684、最大 1692 |
+| 派生列 | 涨跌幅/涨跌额/振幅由 qfq OHLC 计算；换手率 = 成交量(手)×10000/流通股本（instruments 快照近似，拆分股有轻微失真，本步策略不使用该列） |
+
+### 17.3 矩阵引擎与逐票引擎的等价性（selftest）
+
+全池 walk-forward 需要在 5706 只 × 256 组合 × 8 个折窗口上回测，逐票调用统一引擎（`run_backtest`）约需数小时；本步实现向量化矩阵引擎（仓位状态机 + 窗口净值/交易统计），并在合成数据上断言其与逐票引擎**逐票逐窗口一致**：
+
+- 覆盖口径：3 个参数组合 × 4 个窗口（含一个跨停牌段窗口）× 6 只合成股票（含停牌缺口与上市后 20 日才出现的新股），断言总收益/年化/交易次数/盈利交易数/胜率全部一致，最大绝对误差 4.07e-7（float32 舍入量级）；
+- 刻意对齐的边沿语义：停牌日不可成交（开盘 NaN 屏蔽）；信号次日停牌时成交顺延至复牌日（边沿判定取个股自身 t-1/t-2 根 K 线的仓位，不用日历前向填充）；持仓交易日按个股自身 K 线计数；期末仍持仓按窗口内最后一根 K 线收盘强平并计入胜率；回撤从个股窗口首根 K 线净值起算（与 `compute_metrics` 一致）；窗口首日不成交（引擎要求 t 与 t-1 均在窗口内）。
+
+### 17.4 walk-forward 结果（256 组合 × 4 折）
+
+每折按样本内全池平均总收益选出最优参数，观察其样本外表现（"样本外"是全池平均总收益，各年 ≈ 年化）：
+
+| fold | 样本内 | 样本外 | 样本内最优参数 | 样本内年化均值 | 样本外总收益 | 样本外排名/256 | TSP 默认参数样本外 | 全网格样本外中位数 |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2020~2022 | 2023 | n_days=20, vol=1.0, stop=0, hold=15 | +2.22% | +0.09% | 17 | −0.001% | −0.008% |
+| 2 | 2020~2023 | 2024 | n_days=20, vol=1.0, stop=0, hold=15 | +1.50% | +1.68% | 32 | −0.155% | −0.055% |
+| 3 | 2020~2024 | 2025 | n_days=40, vol=1.0, stop=0, hold=15 | +1.31% | +1.47% | 11 | +0.655% | +0.422% |
+| 4 | 2020~2025 | 2026(至07-13) | n_days=40, vol=1.0, stop=0, hold=15 | +1.26% | −0.60% | 246 | −0.096% | −0.060% |
+
+过拟合诊断（与第 6 章同款指标）：
+
+| 指标 | 值 | 解读 |
+| --- | ---: | --- |
+| Spearman ρ（样本内均值 vs 样本外均值，256 组合） | **+0.549** | 正相关且远高于第 6 章 4 标的典型值——该网格参数面可外推性较好 |
+| 样本内全局最优（40,1.0,0,15）的样本外平均分位 | 30% | 位于样本外前 1/3（每折排名 13/12/11/246） |
+| 翻转率（样本内前 1/4 → 样本外后 1/4） | 3% | 很低（第 6 章各标的 10%~30% 量级） |
+| 邻点粗糙度（相邻格点年化落差均值） | 样本内 0.30%/步，样本外 0.18%/步 | 参数面平滑，最优区域是"山丘"而非噪声尖峰 |
+
+### 17.5 稳健参数 vs TSP 默认参数（全样本期 2020-01 ~ 2026-07）
+
+稳健参数（跨折样本外年化均值最优）与 TSP 默认参数的全样本期对比：
+
+| 指标（全池横截面） | 稳健参数 (n_days=40, vol=1.0, stop=0, hold=20) | TSP 默认 (n_days=60, vol=1.5, stop=−6%, hold=15) |
+| --- | ---: | ---: |
+| 全池平均总收益（2020-01 ~ 2026-07，约 6.5 年） | **+11.43%** | +4.57% |
+| 全池中位总收益 | +3.63% | 0.00% |
+| 正收益股票占比 | 58.6% | 37.6% |
+| 年化均值 | +1.10% | +0.70% |
+| 最大回撤均值 | −15.66% | −5.37% |
+| 胜率均值 | 64.1% | 62.6% |
+| 平均交易次数/票 | 2.42 | 0.93 |
+| 有交易的股票数 / 5706 | 4970 | 3289 |
+| 样本外逐年表现（排名/256） | 2023 +0.19%(5) · 2024 +5.44%(3) · 2025 +1.86%(3) · 2026H1 −0.73%(254) | 98 / 174 / 80 / 159 |
+
+参数各维度的样本外梯度（其余维度固定在最优点）——止损维最清晰：
+
+| stop_loss（n_days=40, vol=1.0, hold=20） | 0（关闭） | −0.10 | −0.06 | −0.03 |
+| --- | ---: | ---: | ---: | ---: |
+| 样本外年化均值 | **+1.88%** | +0.67% | +0.07% | −0.11% |
+
+图（输出 `output/optimize/n_day_low_reversal_pool/`）：
+
+![参数热力图（样本内 vs 样本外）](../output/optimize/n_day_low_reversal_pool/heatmap_pool.png)
+
+![收益-回撤散点与稳健/默认参数全样本期净值对比](../output/optimize/n_day_low_reversal_pool/scatter_pool.png)
+
+![稳健参数 vs TSP 默认参数全池等权平均净值](../output/optimize/n_day_low_reversal_pool/robust_compare.png)
+
+### 17.6 观察与结论
+
+**1. walk-forward 选出的最优参数区域一致且可外推：n_days 20~40、量比门槛 1.0（过滤最松）、关闭止损、最长持有 15~20 日。** 每折样本内独立选参（fold1/2 选 20 日新低、fold3/4 选 40 日新低，其余三维完全一致）收敛到同一区域；ρ=+0.549、翻转率 3%、粗糙度 0.2~0.3%/步。方向与 TSP 默认参数（60 日新低、量比 1.5、−6% 止损）明显不同：**止损在这一策略上是稳定负贡献**（−0.03~−0.10 各档均劣于关闭，样本外年化 +0.67% 降至 −0.11%），因为"新低反转"的盈利来自深跌后的反弹，−6% 的止损恰好在反弹前的洗盘里把赢家砍掉；量比门槛越高越差（1.0 最优）——反转信号本身已隐含"当日收阳"，再叠加放量确认只会错过更多有效信号。
+
+**2. 选参收益在 2023-2025 样本外显著，但 2026 上半年失效。** 稳健参数三年样本外排名 5/3/3（样本外年化 +0.19%/+5.44%/+1.86%），样本内最优参数三年排名 13/12/11；但 2026-01~07 全网格 256 个组合的样本外收益全部 ≤ +0.02%（中位数 −0.06%），稳健参数该期排名 254/256——新低反转策略在 2026 上半年整体失效（与 2026 上半年"强者恒强、弱者更弱"的行情结构一致，深跌股继续阴跌、反弹稀缺）。样本外优势集中在 2023-2025，**不能把选参收益当作未来承诺**。
+
+**3. 全池均值口径的收益温和（年化 +1~2%），与 TSP 原生引擎"全市场唯一正收益"需要对照理解。** TSP 原生引擎按评分（涨幅/量比/动量加权）每日选 Top-100 建组合，吃的是**横截面选优**；本仓库统一引擎是"每只股票独立账户、所有信号都做"的逐票口径，全池等权均值天然被大量平庸信号稀释。两种口径不可直接比大小；本步结论只涉及后者：在逐票口径下，n_day_low_reversal 经 walk-forward 选参后全池平均年化 +1.1%（稳健参数）/ +0.7%（TSP 默认），正收益股票占比 58.6%，是一个"横截面宽度型"的弱正收益信号。
+
+**4. 回撤与收益同源：关闭止损换来的收益增加伴随更深回撤。** 稳健参数全样本期最大回撤均值 −15.7%（默认参数 −5.4%）——没有止损保护的单票账户在 2024 年初、2026 年上半年等急跌段回撤更深；若用于组合构建，应在组合层做风险预算，而不是回到被证伪的 −6% 个股止损。
+
+**5. 本步的结论边界（诚实声明）**：① 幸存者偏差（当前 instruments 快照，退市股不在池内，绝对收益向上偏）；② 2026 年样本外仅为 7 个月（TSP 数据至 2026-07-13，采集中断）；③ 未建模滑点与冲击成本（反转类策略对成交价敏感）；④ qfq 为 TSP adj_factor 事件换算（对应 2026-11-13 instruments 快照与 2026-11-12 复权事件表），换窗口整体重导；⑤ 全池横截面样本共享同一段行情，逐票指标不严格独立；⑥ 历史模拟回测结果不代表未来表现，不构成投资建议。
+
+### 17.7 本步交付与复现
+
+- 交付：`scripts/screener.py`（`--pool full_a` / `--source tsp` / `--tsp-dir`，全 A 池 + 本机 TSP parquet 导入，qfq 换算 + 校验）、`scripts/strategies.py`（`n_day_low_reversal` 策略 + 布尔参数 CLI 解析修复）、`scripts/pool_walkforward.py`（矩阵引擎 + 全池 walk-forward + selftest）、`scripts/backtest.py`（`standardize_stock` 保留量价列）、`scripts/pool_backtest.py`（`--pool/--source/--tsp-dir` 透传）+ 本报告第 17 章 + `output/optimize/n_day_low_reversal_pool/` 下的 `grid_pool.csv`（256 组合 × 4 折样本内/样本外全池指标与排名）、`walkforward.csv`（折级选参）、`diagnostics.csv`（过拟合诊断）、`robust_fullperiod.csv`（稳健 vs 默认全样本期对比）、`pool_mean_equity_{robust,default}.csv`（全池等权平均净值）与 `heatmap_pool.png` / `scatter_pool.png` / `robust_compare.png`；
+- 全 A 日线在 `data/daily/`（不入库）；复现命令见文末附录"全 A 股票池扩展 + n_day_low_reversal 全池 walk-forward"段；矩阵引擎与逐票引擎等价性可随时用 `python scripts/pool_walkforward.py selftest` 复核。
+
+---
+
 ## 附录：复现命令
 
 ```bash
@@ -1992,6 +2099,14 @@ python scripts/pool_backtest.py backtest --strategies rsi,bollinger --lot-only -
 python scripts/pool_backtest.py selftest                  # 合成数据自检（不访问网络）
 python scripts/backtest.py 000001 --strategy rsi          # 逐票净值/交易明细复现（统一报告格式）
 
+# 全 A 股票池扩展 + n_day_low_reversal 全池 walk-forward（第 17 章全部数据的来源；issue #33）
+python scripts/screener.py fetch --pool full_a --source tsp --fetch-start 20190719 --fetch-end 20260713   # 全 A 池（本机 TSP parquet 导入，无需网络，qfq 由 adj_factor 换算）
+python scripts/screener.py status                         # 全 A 池拉取/导入进度
+python scripts/pool_walkforward.py selftest               # 矩阵引擎 vs 逐票引擎等价性自检
+python scripts/pool_walkforward.py run                    # 全池 walk-forward（256 组合 × 4 折，默认小数股全仓口径）
+python scripts/pool_walkforward.py run --grid ndlr_small --no-plot   # 小网格调试
+python scripts/pool_backtest.py backtest --pool full_a --strategies n_day_low_reversal --frac-only   # 全池逐票口径对照（可选）
+
 # 第 7 步日内原型（第 10 章全部数据的来源）：拉取 5 分钟线并记录覆盖范围，然后回测
 python scripts/intraday_backtest.py fetch                  # 拉取 data/minute/<代码>_5min.csv + coverage_5min.csv
 python scripts/intraday_backtest.py backtest               # MA5/MA20 金叉死叉日内回测（默认 4 只、10 万整手）
@@ -2008,6 +2123,6 @@ python scripts/industry_rotation.py backtest --end 20261104 --ind-lookback 120 -
 python scripts/industry_rotation.py selftest                    # 行业动量/权重规划/迷你回测断言
 ```
 
-数据落盘与输出：行情 CSV 在 `data/daily/`（不入库，含沪深300基准缓存 `000300_benchmark.csv`）；统一报告在 `output/backtest/`：`<代码>_<策略标签>_equity.csv`（每日净值）、`<代码>_<策略标签>_trades.csv`（交易明细）、`<代码>_<策略标签>.png`（收益曲线）、`summary_<策略名>.csv`（汇总）。第 4 步输出在 `output/optimize/`：`<策略>/<策略>_<代码>[_frac]_{grid,walkforward,diagnostics}.csv`（全网格指标、fold 级选参、过拟合诊断）与 `{heatmap,scatter}.png`（热力图、收益-回撤散点图），全局汇总 `summary_walkforward.csv`。第 5 步输出在 `output/portfolio/`：`<策略标签>_<方案>[_tag]_equity.csv`（每日净值与各标的/现金权重）、`_trades.csv`（交易明细）、`<策略标签>[_tag]_compare.png`（组合净值对比图）与 `summary_<策略名>[_tag].csv`（汇总，含换手率）。第 6 步输出在 `output/screener/`：`summary_screener.csv`（汇总）、`equity_curves.csv`（每日净值）、`holdings_{momentum,volatility}.csv`（月度持仓）、`latest_picks_{momentum,volatility}.csv`（最近一期 Top-50，股票代码+中文名称两列）与 `screener_compare.png`（净值对比图）；拉取状态与股票池快照在 `data/screener/`（不入库）。第 7 步输出在 `output/intraday/`：`<代码>_ma5_20_equity.csv`（每根 K 线的价格、均线与净值）、`<代码>_ma5_20_trades.csv`（交易明细）、`<代码>_ma5_20.png`（价格+买卖点/净值对比图）与 `summary_ma5_20[_frac].csv`（汇总，含覆盖范围与信号统计）；分钟线数据在 `data/minute/`（不入库，含 `coverage_5min.csv` 覆盖范围记录）。第 8 步新增：`output/screener/` 下的 `*_momentum_reversal.csv`/`screener_compare_momentum_reversal.png`（非默认因子组合用内容化文件名，不覆盖第 8/9 章引用的默认输出）；`output/industry_rotation/`：`summary_sw_rotation.csv`、`equity_curves.csv`、`holdings_{momentum,reversal}.csv`、`latest_picks_{momentum,reversal}.csv` 与 `sw_rotation_compare.png`；申万行业数据缓存 `data/sw/`（不入库）。全股票池样本扩展（第 16 步，issue #31）输出在 `output/backtest/pool/`：`summary_pool_<策略名>[_frac].csv`（逐票一行：策略/买入持有/沪深300 指标与相对买入持有超额、整手约束跳过次数）、`pool_aggregate.csv`（策略 × 口径的横截面统计：均值/中位数、跑赢比例、配对 t、符号检验 z）、`pool_mean_equity_<策略名>[_frac].csv`（全池等权平均净值曲线，含逐日参与股票数 n_stocks）、`pool_compare[_frac].png`（三策略收益分布 + 全池平均净值对比图）；股票池日线仍复用 `data/daily/`（不入库）。
+数据落盘与输出：行情 CSV 在 `data/daily/`（不入库，含沪深300基准缓存 `000300_benchmark.csv`）；统一报告在 `output/backtest/`：`<代码>_<策略标签>_equity.csv`（每日净值）、`<代码>_<策略标签>_trades.csv`（交易明细）、`<代码>_<策略标签>.png`（收益曲线）、`summary_<策略名>.csv`（汇总）。第 4 步输出在 `output/optimize/`：`<策略>/<策略>_<代码>[_frac]_{grid,walkforward,diagnostics}.csv`（全网格指标、fold 级选参、过拟合诊断）与 `{heatmap,scatter}.png`（热力图、收益-回撤散点图），全局汇总 `summary_walkforward.csv`。第 5 步输出在 `output/portfolio/`：`<策略标签>_<方案>[_tag]_equity.csv`（每日净值与各标的/现金权重）、`_trades.csv`（交易明细）、`<策略标签>[_tag]_compare.png`（组合净值对比图）与 `summary_<策略名>[_tag].csv`（汇总，含换手率）。第 6 步输出在 `output/screener/`：`summary_screener.csv`（汇总）、`equity_curves.csv`（每日净值）、`holdings_{momentum,volatility}.csv`（月度持仓）、`latest_picks_{momentum,volatility}.csv`（最近一期 Top-50，股票代码+中文名称两列）与 `screener_compare.png`（净值对比图）；拉取状态与股票池快照在 `data/screener/`（不入库）。第 7 步输出在 `output/intraday/`：`<代码>_ma5_20_equity.csv`（每根 K 线的价格、均线与净值）、`<代码>_ma5_20_trades.csv`（交易明细）、`<代码>_ma5_20.png`（价格+买卖点/净值对比图）与 `summary_ma5_20[_frac].csv`（汇总，含覆盖范围与信号统计）；分钟线数据在 `data/minute/`（不入库，含 `coverage_5min.csv` 覆盖范围记录）。第 8 步新增：`output/screener/` 下的 `*_momentum_reversal.csv`/`screener_compare_momentum_reversal.png`（非默认因子组合用内容化文件名，不覆盖第 8/9 章引用的默认输出）；`output/industry_rotation/`：`summary_sw_rotation.csv`、`equity_curves.csv`、`holdings_{momentum,reversal}.csv`、`latest_picks_{momentum,reversal}.csv` 与 `sw_rotation_compare.png`；申万行业数据缓存 `data/sw/`（不入库）。全股票池样本扩展（第 16 步，issue #31）输出在 `output/backtest/pool/`：`summary_pool_<策略名>[_frac].csv`（逐票一行：策略/买入持有/沪深300 指标与相对买入持有超额、整手约束跳过次数）、`pool_aggregate.csv`（策略 × 口径的横截面统计：均值/中位数、跑赢比例、配对 t、符号检验 z）、`pool_mean_equity_<策略名>[_frac].csv`（全池等权平均净值曲线，含逐日参与股票数 n_stocks）、`pool_compare[_frac].png`（三策略收益分布 + 全池平均净值对比图）；股票池日线仍复用 `data/daily/`（不入库）。全 A 池扩展与 n_day_low_reversal 全池 walk-forward（第 17 步，issue #33）输出在 `output/optimize/n_day_low_reversal_pool/`：`grid_pool.csv`（256 组合 × 4 折样本内/样本外全池指标与排名）、`walkforward.csv`（折级选参结果）、`diagnostics.csv`（过拟合诊断）、`robust_fullperiod.csv`（稳健参数与 TSP 默认参数全样本期对比）、`pool_mean_equity_{robust,default}.csv`（全池等权平均净值曲线）与 `heatmap_pool.png` / `scatter_pool.png` / `robust_compare.png`；全 A 日线由 `screener.py fetch --pool full_a --source tsp` 导入 `data/daily/`（不入库，本机 TSP parquet + adj_factor 换算 qfq）。
 
 **⚠ 免责声明**：本日志全部内容为历史模拟回测，仅用于个人量化学习，不代表未来表现，不构成投资建议。

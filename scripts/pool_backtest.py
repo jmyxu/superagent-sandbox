@@ -112,6 +112,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_fetch.add_argument("--retries", type=int, default=3, help="单只股票失败重试次数，默认 3")
     p_fetch.add_argument("--max-stocks", type=int, default=None,
                          help="只处理前 N 只（分批拉取用，续跑自动跳过已完成）")
+    p_fetch.add_argument("--skip", type=int, default=0,
+                         help="跳过前 N 只（多进程分段并行用，如 --skip 400）")
     p_fetch.add_argument("--prefer", choices=["em", "tx"], default="em",
                          help="数据源优先：em 东财（默认，失败退腾讯）/ tx 腾讯（东财 IP 限流时段用）")
 
@@ -643,6 +645,8 @@ def main(argv: list[str] | None = None) -> int:
         socket.setdefaulttimeout(90)  # 上游限流时请求可能很慢，兜底防挂起（与 screener 一致）
         try:
             universe = fetch_universe(offline=False)
+            if args.skip:
+                universe = universe.iloc[args.skip:].reset_index(drop=True)
             return run_fetch(universe, args.fetch_start, args.fetch_end,
                              DATADIR_DEFAULT, args.sleep, args.retries,
                              args.max_stocks, offline=False, prefer=args.prefer)

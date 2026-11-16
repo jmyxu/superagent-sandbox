@@ -2,3 +2,5 @@
 akshare>=1.20.22
 pandas>=2.2
 matplotlib>=3.8
+# 第 9 步资金流因子研究（scripts/fetch_fund_flow.py 直连东财免费接口）
+requests>=2.31

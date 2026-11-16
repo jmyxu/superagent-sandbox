@@ -6,6 +6,7 @@
 > 版本：v0.6（新增第 8 章：`scripts/screener.py` 横截面选股，第 6 步）
 > 版本：v0.7（新增第 10 章：`scripts/intraday_backtest.py` 日内 5 分钟线回测，第 7 步日内研究）
 > 版本：v0.8（新增第 16 章：`scripts/pool_backtest.py` 全股票池样本扩展回测——RSI/布林带/MA 交叉 × 800 只，issue #31）
+> 版本：v0.9（新增第 17 章：大单资金流因子研究——东财免费口径个股资金流拉取 + 因子构建 + 日度 IC + 五分位组合回测，issue #34）
 > 数据快照：2026-11-03 拉取的 qfq 前复权日线（个股经 akshare 腾讯源，沪深300 经新浪源；东财接口当时被限流）；第 4 步把行情起点前移至 2017-01-01（300750 自上市日 2018-06-11）用于参数热身，经 akshare 东财接口，2019-11-20 之后与第 3 步快照逐值一致
 > **⚠ 免责声明：本日志所有回测均为历史模拟，仅用于学习方法验证；历史模拟回测结果不代表未来表现，不构成投资建议。**
 
@@ -1894,6 +1895,90 @@
 
 ---
 
+## 17. 大单资金流因子研究（东财免费口径 · issue #34）
+
+> 任务来源：[GitHub issue #34](https://github.com/jmyxu/superagent-sandbox/issues/34)（JIANGMINGYA）。
+> 新增脚本：`scripts/fetch_fund_flow.py`（东财免费接口个股资金流拉取，http/https 双通道 + 断点续跑 + 分段并行）与 `scripts/fund_flow_factor.py`（资金流因子构建 + 日度 rank IC + 五分位组合回测 + 基准因子对照）；调研文档 `docs/fund-flow-factor-research.md`。
+> **⚠ 免责声明：本节全部内容为历史模拟回测，仅用于学习方法验证；历史模拟回测结果不代表未来表现，不构成投资建议。**
+
+### 17.1 动机与口径
+
+**动机**：issue #34 要求研究"大单资金流"因子。券商金工研报普遍宣称"主力资金净流入强度"有正的月度 IC，但公开可复现的免费数据实证很少；本步用东财免费接口在统一框架（第 6 步股票池 + 统一执行纪律）下独立检验，不依赖任何付费数据。
+
+**东财资金流口径**（免费接口）：每笔成交按金额分四档——超大单 ≥100 万元（或 ≥50 万股）、大单 20 万~100 万元、中单 4 万~20 万元、小单 <4 万元；主力 = 超大单 + 大单；净流入 = 主动买入额 − 主动卖出额。
+
+**关键限制（如实声明）**：东财免费接口只提供**最近约 120 个交易日**的个股资金流历史；截至研究日可取窗口为 2026-05-07 ~ 2026-11-13（约 6 个月，130 个交易日）。更长历史需东财付费口径，本步不以任何方式补数据、不混用其他源，**全部结论限定在该 6 个月窗口内**。
+
+### 17.2 方法
+
+| 项目 | 口径 |
+| --- | --- |
+| 股票池 | 第 6 步同款：沪深300+中证500 当前成分股去重快照（800 只，快照 2026-11-16；幸存者偏差同第 8/16 章声明） |
+| 资金流数据 | 东财免费接口 `push2his .../fflow/daykline/get`（http 优先、https 回退），逐票落盘 `data/fundflow/<代码>.csv`（不入库，断点续跑） |
+| 行情数据 | 第 6 步同款 qfq 日线（2026-11-16 拉取；东财行情接口对本 IP 限流，股票池经 akshare 腾讯源；腾讯源无成交额 → 按东财净占比定义反推 `成交额 = 主力净额 ÷ 主力净占比`，两口径并存时核对偏差超 35% 的票剔除） |
+| 因子 | 资金流强度 `tier_N = Σ(N日 tier净流入) ÷ Σ(N日 成交额)`，tier ∈ {主力 main，大单 big，超大单 super，小单 small}，N ∈ {1,5,10,20}（small 仅 5/20 两档）；基准因子 rev5/rev20（短期反转）、mom20（动量）、vol20（低波动取负） |
+| 评估 | ① 日度横截面 Spearman rank IC（因子 vs 未来 1/5/10/20 日收益），报告天数、均值、t 值（h>1 重叠样本会使 t 高估，仅横向比较）、年化 ICIR、正占比；② 五分位组合每 5 个交易日调仓：Top 多头 / Bottom 多头 / Top-Bottom 多空（假设口径，A 股不能做空），t 日收盘排序、t+1 日起成员日收益等权（停牌日收益按 0 冻结，未建模开盘跳空），成本按调仓买卖权重差计费（买佣金万三、卖佣金万三+印花万五），对照沪深300 与全池等权 |
+
+### 17.3 数据覆盖与拉取工程
+
+| 项目 | 内容 |
+| --- | --- |
+| 资金流 | 成功 796 只、空历史 0 只、窗口内失败 4 只（300390/300433/600085/600170，东财接口对个别代码间歇性无响应，面板如实剔除）；覆盖 2026-05-07 ~ 2026-11-13 |
+| 行情 | 800 只经腾讯源 qfq 拉取（20260401 起，0 失败），沪深300 基准经新浪备用源缓存 `data/daily/000300_benchmark.csv` |
+| 面板 | 796 只 × 130 个交易日；剔除——无资金流 4、无日线/无重叠 0、成交额口径异常 0、样本过短 0 |
+| 限流工程（如实记录） | 东财按 IP 限流并"封禁突发客户端"（burst ban）：实测本 IP 上 https 通道被重置、http 通道间歇可用，且封禁呈"开窗/关窗"波浪（曾出现一次持续约 7 小时的整段封禁；push2 的 clist 与 datacenter 接口全程可用，仅 fflow/kline 等接口被定向封禁）。本步用 http/https 双通道 + 状态断点续跑 + 分段多进程（--skip 分段）+ 失败重跑，多轮次补齐全池；拉取全程 0 手动干预，进度与失败清单落盘 `data/fundflow/fetch_state.csv` 与 `fetch_failures.txt` |
+
+### 17.4 IC 结果
+
+窗口市场环境：全池等权 -11.0%、沪深300 -18.0%（回调市），反转与低波动因子处于强势状态。日度横截面 rank IC（vs 未来 h 日收益）：
+
+| 因子 | h=1 | h=5 | h=10 | h=20 |
+| --- | ---: | ---: | ---: | ---: |
+| main_1（主力 1日） | -0.003 | +0.015 (t=1.4) | +0.020 (t=1.6) | +0.012 |
+| main_20（主力 20日） | -0.009 | **-0.027** (t=-3.1) | -0.043 (t=-5.8) | -0.061 (t=-8.2) |
+| big_20（大单 20日） | -0.003 | -0.011 (t=-1.6) | -0.022 (t=-3.6) | -0.035 (t=-6.4) |
+| super_20（超大单 20日） | -0.011 | **-0.033** (t=-3.2) | -0.046 (t=-5.2) | -0.062 (t=-6.4) |
+| small_20（小单 20日） | +0.002 | +0.005 | +0.020 (t=2.5) | +0.048 (t=6.1) |
+| rev20（基准） | +0.038 | +0.105 (t=3.8) | +0.121 (t=4.8) | +0.144 (t=5.2) |
+| vol20（基准） | +0.079 | +0.151 (t=3.9) | +0.228 (t=6.1) | +0.307 (t=8.3) |
+
+![资金流因子 IC 对比](../output/fund_flow_factor/ic_compare.png)
+
+### 17.5 五分位组合结果（周频调仓、含成本）
+
+| 因子 | Top 多头 | Bottom 多头 | Top-Bottom 多空 | 平均单边换手/次 |
+| --- | ---: | ---: | ---: | ---: |
+| main_1 | -9.5% | -25.4% | +21.8% | 77% |
+| super_1 | -8.7% | -26.2% | +23.6% | 77% |
+| main_20 | -15.0% | -9.0% | **-7.3%** | 37% |
+| super_20 | -17.8% | -10.4% | **-9.5%** | 38% |
+| big_20 | -8.4% | -8.6% | +1.0% | 34% |
+| rev20（基准） | -10.5% | -32.6% | +33.1% | 41% |
+| vol20（基准） | +6.9% | -36.9% | +54.8% | 18% |
+| 全池等权 | -11.0% | — | — | — |
+| 沪深300 | -18.0% | — | — | — |
+
+![五分位组合净值对比](../output/fund_flow_factor/quintile_compare.png)
+
+### 17.6 观察与结论
+
+**1. "主力净流入强度正向预测收益"的民间说法在本窗口被明确拒绝。** 20 日口径的 main_20 / super_20 rank IC 显著为负（-0.027 / -0.033，t≈-3.1；h=20 时 t 达 -8.2 / -6.4），多空组合扣成本后 -7.3% / -9.5%——过去一个月大资金大幅流入的股票，未来一个月显著跑输。方向与"聪明钱看多"的直觉相反，与第 11 章"A 股短期反转强、追涨动量弱"的结构一致：资金流强度在横截面上与 mom20 正相关（+0.3~+0.5）、与 rev20 负相关，本质是动量的镜像。
+
+**2. 短期（1 日）资金流有微弱的正信号，但实盘意义弱。** main_1 / super_1 对未来 5~10 日收益 IC +0.015~+0.023（t≈1.4~2.0，不显著）；多空组合 +21.8% / +23.6% 的盈利全部来自 bottom 腿（当日主力巨额流出股继续下跌 -25%~-26%），且周频单边换手高达 77%——佣金已计入但冲击成本未建模，真实可执行性存疑。
+
+**3. 小单腿是主力腿的算术镜像。** small_20 IC +0.048（h=20，t=6.1）与 main_20 负 IC 互为镜像（净流入总和守恒），不代表散户流入有独立正信号，解释时须谨慎。
+
+**4. 同期基准因子全面更强。** rev20 多空 +33.1%、vol20 多空 +54.8%（且 vol20 Top 多头 +6.9% 是唯一正收益的长仓组合、换手仅 18%/次）；资金流因子在本窗口无增量信息。
+
+**5. 结论边界（诚实声明）**：本窗口是回调市（全池 -11%、沪深300 -18%），反转/低波动主导；资金流因子是否在趋势市转为正、以及其长期（多年）表现，必须依赖东财付费历史数据检验——免费口径 6 个月窗口是硬性上限。本步结论为"免费口径下不可作为正向选股因子"，不推广到其他市场状态。
+
+### 17.7 本步交付与复现
+
+- 交付：`scripts/fetch_fund_flow.py`（fetch/status/selftest，断点续跑 + --skip 分段并行）+ `scripts/fund_flow_factor.py`（run/selftest）+ `docs/fund-flow-factor-research.md` + 本章 + `output/fund_flow_factor/`（ic_summary/ic_daily/quintile_summary/quintile_equity/factor_stats/factor_corr CSV 与 ic_compare.png / quintile_compare.png 两张对比图）；
+- 复现命令见文末附录"大单资金流因子研究"段。
+
+---
+
 ## 附录：复现命令
 
 ```bash
@@ -1992,6 +2077,14 @@ python scripts/pool_backtest.py backtest --strategies rsi,bollinger --lot-only -
 python scripts/pool_backtest.py selftest                  # 合成数据自检（不访问网络）
 python scripts/backtest.py 000001 --strategy rsi          # 逐票净值/交易明细复现（统一报告格式）
 
+# 大单资金流因子研究（第 17 章全部数据的来源；issue #34，东财免费口径）
+python scripts/fetch_fund_flow.py fetch --sleep 0.5       # 拉取个股资金流（东财免费接口 http 优先，断点续跑；分 --skip 多进程并行）
+python scripts/fetch_fund_flow.py status                  # 拉取进度/失败清单（失败重跑自动补）
+python scripts/fetch_fund_flow.py selftest                # 合成数据解析/落盘/状态自检（不访问网络）
+python scripts/pool_backtest.py fetch --fetch-start 20260401 --fetch-end 20261231 --prefer tx   # 行情经腾讯源（东财限流时段）
+python scripts/fund_flow_factor.py run --bench            # 因子构建 + 日度 IC + 五分位组合（窗口 2026-05-21~2026-11-13）
+python scripts/fund_flow_factor.py selftest               # 合成数据算法自检（不访问网络）
+
 # 第 7 步日内原型（第 10 章全部数据的来源）：拉取 5 分钟线并记录覆盖范围，然后回测
 python scripts/intraday_backtest.py fetch                  # 拉取 data/minute/<代码>_5min.csv + coverage_5min.csv
 python scripts/intraday_backtest.py backtest               # MA5/MA20 金叉死叉日内回测（默认 4 只、10 万整手）
@@ -2008,6 +2101,6 @@ python scripts/industry_rotation.py backtest --end 20261104 --ind-lookback 120 -
 python scripts/industry_rotation.py selftest                    # 行业动量/权重规划/迷你回测断言
 ```
 
-数据落盘与输出：行情 CSV 在 `data/daily/`（不入库，含沪深300基准缓存 `000300_benchmark.csv`）；统一报告在 `output/backtest/`：`<代码>_<策略标签>_equity.csv`（每日净值）、`<代码>_<策略标签>_trades.csv`（交易明细）、`<代码>_<策略标签>.png`（收益曲线）、`summary_<策略名>.csv`（汇总）。第 4 步输出在 `output/optimize/`：`<策略>/<策略>_<代码>[_frac]_{grid,walkforward,diagnostics}.csv`（全网格指标、fold 级选参、过拟合诊断）与 `{heatmap,scatter}.png`（热力图、收益-回撤散点图），全局汇总 `summary_walkforward.csv`。第 5 步输出在 `output/portfolio/`：`<策略标签>_<方案>[_tag]_equity.csv`（每日净值与各标的/现金权重）、`_trades.csv`（交易明细）、`<策略标签>[_tag]_compare.png`（组合净值对比图）与 `summary_<策略名>[_tag].csv`（汇总，含换手率）。第 6 步输出在 `output/screener/`：`summary_screener.csv`（汇总）、`equity_curves.csv`（每日净值）、`holdings_{momentum,volatility}.csv`（月度持仓）、`latest_picks_{momentum,volatility}.csv`（最近一期 Top-50，股票代码+中文名称两列）与 `screener_compare.png`（净值对比图）；拉取状态与股票池快照在 `data/screener/`（不入库）。第 7 步输出在 `output/intraday/`：`<代码>_ma5_20_equity.csv`（每根 K 线的价格、均线与净值）、`<代码>_ma5_20_trades.csv`（交易明细）、`<代码>_ma5_20.png`（价格+买卖点/净值对比图）与 `summary_ma5_20[_frac].csv`（汇总，含覆盖范围与信号统计）；分钟线数据在 `data/minute/`（不入库，含 `coverage_5min.csv` 覆盖范围记录）。第 8 步新增：`output/screener/` 下的 `*_momentum_reversal.csv`/`screener_compare_momentum_reversal.png`（非默认因子组合用内容化文件名，不覆盖第 8/9 章引用的默认输出）；`output/industry_rotation/`：`summary_sw_rotation.csv`、`equity_curves.csv`、`holdings_{momentum,reversal}.csv`、`latest_picks_{momentum,reversal}.csv` 与 `sw_rotation_compare.png`；申万行业数据缓存 `data/sw/`（不入库）。全股票池样本扩展（第 16 步，issue #31）输出在 `output/backtest/pool/`：`summary_pool_<策略名>[_frac].csv`（逐票一行：策略/买入持有/沪深300 指标与相对买入持有超额、整手约束跳过次数）、`pool_aggregate.csv`（策略 × 口径的横截面统计：均值/中位数、跑赢比例、配对 t、符号检验 z）、`pool_mean_equity_<策略名>[_frac].csv`（全池等权平均净值曲线，含逐日参与股票数 n_stocks）、`pool_compare[_frac].png`（三策略收益分布 + 全池平均净值对比图）；股票池日线仍复用 `data/daily/`（不入库）。
+数据落盘与输出：行情 CSV 在 `data/daily/`（不入库，含沪深300基准缓存 `000300_benchmark.csv`）；统一报告在 `output/backtest/`：`<代码>_<策略标签>_equity.csv`（每日净值）、`<代码>_<策略标签>_trades.csv`（交易明细）、`<代码>_<策略标签>.png`（收益曲线）、`summary_<策略名>.csv`（汇总）。第 4 步输出在 `output/optimize/`：`<策略>/<策略>_<代码>[_frac]_{grid,walkforward,diagnostics}.csv`（全网格指标、fold 级选参、过拟合诊断）与 `{heatmap,scatter}.png`（热力图、收益-回撤散点图），全局汇总 `summary_walkforward.csv`。第 5 步输出在 `output/portfolio/`：`<策略标签>_<方案>[_tag]_equity.csv`（每日净值与各标的/现金权重）、`_trades.csv`（交易明细）、`<策略标签>[_tag]_compare.png`（组合净值对比图）与 `summary_<策略名>[_tag].csv`（汇总，含换手率）。第 6 步输出在 `output/screener/`：`summary_screener.csv`（汇总）、`equity_curves.csv`（每日净值）、`holdings_{momentum,volatility}.csv`（月度持仓）、`latest_picks_{momentum,volatility}.csv`（最近一期 Top-50，股票代码+中文名称两列）与 `screener_compare.png`（净值对比图）；拉取状态与股票池快照在 `data/screener/`（不入库）。第 7 步输出在 `output/intraday/`：`<代码>_ma5_20_equity.csv`（每根 K 线的价格、均线与净值）、`<代码>_ma5_20_trades.csv`（交易明细）、`<代码>_ma5_20.png`（价格+买卖点/净值对比图）与 `summary_ma5_20[_frac].csv`（汇总，含覆盖范围与信号统计）；分钟线数据在 `data/minute/`（不入库，含 `coverage_5min.csv` 覆盖范围记录）。第 8 步新增：`output/screener/` 下的 `*_momentum_reversal.csv`/`screener_compare_momentum_reversal.png`（非默认因子组合用内容化文件名，不覆盖第 8/9 章引用的默认输出）；`output/industry_rotation/`：`summary_sw_rotation.csv`、`equity_curves.csv`、`holdings_{momentum,reversal}.csv`、`latest_picks_{momentum,reversal}.csv` 与 `sw_rotation_compare.png`；申万行业数据缓存 `data/sw/`（不入库）。全股票池样本扩展（第 16 步，issue #31）输出在 `output/backtest/pool/`：`summary_pool_<策略名>[_frac].csv`（逐票一行：策略/买入持有/沪深300 指标与相对买入持有超额、整手约束跳过次数）、`pool_aggregate.csv`（策略 × 口径的横截面统计：均值/中位数、跑赢比例、配对 t、符号检验 z）、`pool_mean_equity_<策略名>[_frac].csv`（全池等权平均净值曲线，含逐日参与股票数 n_stocks）、`pool_compare[_frac].png`（三策略收益分布 + 全池平均净值对比图）；股票池日线仍复用 `data/daily/`（不入库）。大单资金流因子研究（第 17 章，issue #34）资金流数据在 `data/fundflow/`（不入库，含 `fetch_state.csv` 断点续跑状态）；输出在 `output/fund_flow_factor/`：`ic_summary.csv`（因子 × 窗口的 IC 汇总）、`ic_daily.csv`（逐日 IC 明细）、`quintile_summary.csv`（五分位组合指标）、`quintile_equity.csv`（逐日净值）、`factor_stats.csv`（因子分布统计）、`factor_corr.csv`（因子间横截面平均 Spearman 相关）与 `ic_compare.png` / `quintile_compare.png` 对比图。
 
 **⚠ 免责声明**：本日志全部内容为历史模拟回测，仅用于个人量化学习，不代表未来表现，不构成投资建议。

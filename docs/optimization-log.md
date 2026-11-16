@@ -6,6 +6,7 @@
 > 版本：v0.6（新增第 8 章：`scripts/screener.py` 横截面选股，第 6 步）
 > 版本：v0.7（新增第 10 章：`scripts/intraday_backtest.py` 日内 5 分钟线回测，第 7 步日内研究）
 > 版本：v0.8（新增第 16 章：`scripts/pool_backtest.py` 全股票池样本扩展回测——RSI/布林带/MA 交叉 × 800 只，issue #31）
+> 版本：v0.9（新增第 18 章：`scripts/alpha_factors.py` 开源经典因子库移植——WorldQuant Alpha101 全部 101 个 + Qlib Alpha158 量价部分 158 个，issue #36）
 > 数据快照：2026-11-03 拉取的 qfq 前复权日线（个股经 akshare 腾讯源，沪深300 经新浪源；东财接口当时被限流）；第 4 步把行情起点前移至 2017-01-01（300750 自上市日 2018-06-11）用于参数热身，经 akshare 东财接口，2019-11-20 之后与第 3 步快照逐值一致
 > **⚠ 免责声明：本日志所有回测均为历史模拟，仅用于学习方法验证；历史模拟回测结果不代表未来表现，不构成投资建议。**
 
@@ -2001,6 +2002,79 @@
 
 ---
 
+## 18. 开源经典因子库移植：WorldQuant Alpha101 + Qlib Alpha158 量价（issue #36）
+
+> 任务来源：[GitHub issue #36](https://github.com/jmyxu/superagent-sandbox/issues/36)（JIANGMINGYA）。
+> 新增脚本：`scripts/alpha_factors.py` —— WorldQuant Alpha101（101 个公式化 alpha）与 Qlib Alpha158 量价部分（158 个特征）的移植，含 `selftest`（合成数据自检）与 `compute`（真实数据计算 + 最新一期横截面输出）。
+> 版本：v0.9。
+> **⚠ 免责声明：本章全部内容为历史数据上的因子计算与覆盖率统计，仅用于学习方法验证；不构成投资建议。**
+
+### 18.1 本步做了什么
+
+用户要求"扩大因子库"：把两个被广泛使用的开源因子库移植到本项目的数据口径（A 股 qfq 日线，OHLCV + 成交额），使第 6/8 步的横截面选股研究有更大因子池可用。
+
+| 项目 | 内容 |
+| --- | --- |
+| Alpha101 | Kakushadze (2016), "101 Formulaic Alphas" 的全部 101 个公式化 alpha：**82 个只依赖 OHLCV**（含派生 vwap/returns）；**18 个依赖行业分类**（IndNeutralize/indneutralize，论文区分 sector/industry/subindustry 三级）；**1 个（alpha056）依赖市值 cap** |
+| Alpha158（量价部分） | Microsoft Qlib `contrib/data/handler.py` Alpha158 **默认配置**的全部 158 个特征：9 个 K 线特征（KMID/KLEN/KMID2/KUP/KUP2/KLOW/KLOW2/KSFT/KSFT2）+ 4 个原始价格特征（OPEN0/HIGH0/LOW0/VWAP0）+ 29 种滚动算子 × 5 窗口（5/10/20/30/60） |
+| 数据口径 | 与第 6/17 步一致的 qfq 日线；**vwap = 成交额 / 成交量**（本项目日线无真实 VWAP 字段，近似口径如实声明）；returns = 个股自身交易日的涨跌幅（跳过停牌日） |
+| 停牌处理 | 时间序列算子按**个股自身连续交易日**滑动（压缩掉 NaN 后计算、结果放回并集日历原位），与第 6 步 factor_volatility 同口径；横截面算子（rank/scale/indneutralize）在同一日期对非 NaN 股票计算 |
+| 输出 | `output/factors/alpha101_latest.csv`（股票 × 101）、`alpha158_latest.csv`（股票 × 158）、`alpha101_coverage_summary.csv` / `alpha158_coverage_summary.csv`（因子 × 有效值占比与描述统计） |
+
+### 18.2 移植口径：与论文 / Qlib 语义的对齐（本步最需要交代的部分）
+
+1. **rank 恢复论文的横截面语义**。论文的 rank(x) 是同一日期、全股票池内的分位秩。公开的单股票移植版（如 [yli188 的 pandas 版](https://github.com/yli188/WorldQuant_alpha101_code)）受数据形态限制把 rank 退化为时间序列秩；本实现恢复横截面语义（axis=1 的 pct rank），与本项目横截面选股的用途一致。
+2. **scale 同理为横截面**：x / Σ\|x\|，Σ 取同一日期的全股票池（论文原文 cross-sectional 定义）。
+3. **Qlib 语义逐条对齐**（Alpha158）：滚动算子 `min_periods=1`（窗口不足时用已有值，qlib Rolling 语义）；Std 用 ddof=1（pandas/qlib 原生）；RANK 用 pandas `rolling.rank(pct=True)`（qlib 主路径）；BETA/RSQR/RESI 用 qlib `data/_libs/rolling.pyx` 的闭式等价（窗口内对位置做 OLS，最新值 x=窗口长度——即"对窗口内序号 0..N-1 回归"，selftest 与 `np.polyfit` 逐值验证）；CORR/CORD 在任一侧滚动 std(ddof=1)≈0（atol 2e-5）时置 NaN（qlib 后处理同款）；IMAX/IMIN 返回窗口内最高/最低价的位置（1 起）再除以窗口长。
+4. **小数窗口四舍五入**：论文里 3.92795 之类的窗口参数按 `int(round())` 取整（与公开移植版一致），原值保留在代码注释中备查。
+5. **advN 口径**：论文的 AverageDollarVolume 本项目用**成交量（手）的 N 日均值**近似（成交额口径的 adv 未实现，如实声明）。
+6. **行业/市值依赖 alpha 的降级**：未提供 `industry`/`cap` 输入时，对应 19 个 alpha 返回全 NaN 并在 stderr 告警（不静默跳过）；接口已就绪，调用方可传申万一级等单一分类近似论文的 sector/industry/subindustry 三级分类、传市值序列解锁 alpha056。
+7. **±inf 统一置 NaN**：除零、log(0) 等产生的 ±inf 在结果中统一替换为 NaN（与项目"数据卫生"原则一致）。
+8. **stddev 口径**：Alpha101 的 stddev 用 pandas rolling std（ddof=1，与最常用的 pandas 移植版一致）；Alpha158 的 STD 同为 ddof=1（qlib 原生）。
+
+来源：Kakushadze (2016) [arxiv:1601.00991](https://arxiv.org/abs/1601.00991)；[qlib handler.py](https://github.com/microsoft/qlib/blob/main/qlib/contrib/data/handler.py) / [loader.py](https://github.com/microsoft/qlib/blob/main/qlib/contrib/data/loader.py)（MIT License）；公式对照参考 yli188 移植版（未直接引用代码）。
+
+### 18.3 验证
+
+**1. selftest（合成数据，不访问网络）**，`python scripts/alpha_factors.py selftest` 共 7 组断言：
+
+- 名单与形状：Alpha101 共 101 个、Alpha158 共 158 个（9+4+29×5），全部与预期名单逐名一致，无 ±inf；
+- **无未来函数·截断一致性**：用前 200 天重算，第 199 天（t=199）处与完整计算逐值相等——101 + 158 全部通过；
+- **无未来函数·未来扰动不变性**：把最后 40 天价格×1.5、成交量×10 扰动后重算，前 219 行逐值不变；
+- **停牌缺口**：人为给两只股票各插一段并集日历 NaN（模拟停牌），断言停牌行全 NaN、复牌后首个有效值与"去掉停牌行后的连续日历"计算结果逐值一致；
+- **手工精确值**：alpha101/alpha012 与手算一致；KMID/KUP/ROC5/VMA5/SUMP5/RANK5 与手算一致；BETA5/RSQR5/RESI5 与 `np.polyfit` 一致；IMAX/IMIN 值域 (0,1]；
+- **横截面 rank 语义**：每行分位秩均值 = (m+1)/(2m)（m=股票数，pct rank 的数学性质）；
+- **行业/市值依赖**：19 个依赖 alpha 缺输入时全 NaN，提供合成行业/市值后产生有限值。
+
+**2. 真实数据验证**（全 A 池 qfq 日线，TSP parquet 导入缓存复用，2019-07-19 ~ 2026-07-13，1692 个交易日，400 只抽样）：
+
+| 指标 | Alpha101 | Alpha158 |
+| --- | ---: | ---: |
+| 面板 | 1692 交易日 × 400 只 | 同左 |
+| 有效值占比中位数 | 93.4% | 95.4% |
+| 有效值占比最低 | 0.0%（alpha048：18 个行业依赖 alpha + alpha056 市值依赖本步未提供输入 → 全 NaN；纯量价 82 个的最低为 alpha032 的 230 日相关窗口热身） | 91.9%（ROC60 的 60 日滞后窗口热身） |
+| 单次计算耗时 | 39s（101 个） | 16s（158 个） |
+
+注：Alpha101 的"有效值占比"最低为 0% 是**预期的**——19 个行业/市值依赖 alpha 在本步演示中未提供输入（见 18.4 局限 4）；82 个纯量价 alpha 的中位覆盖率 93.4% 已含各 alpha 自身的窗口热身（窗口越长覆盖率越低）。真实数据上的抽查：000001 最新一期 alpha101 = 0.70231、KMID = 0.011516、ROC5 = 0.996205、MA5 = 0.997154，与按定义手算逐位一致。演示输出为 `output/factors/` 下的四个 CSV（400 只 × 因子矩阵 + 覆盖率统计）。
+
+**3. 与第 6 步 screener 的衔接**：`compute_alpha101/compute_alpha158` 接受宽表字典（date × symbol，`prepare_frames` 由长表转换、`load_frames` 从 data/daily 逐票增量构建，均与 screener 的 `build_panel` 产物同构），可直接作为第 6 步因子池扩展的输入；`compute` 命令逐因子流式计算并落盘（大股票池下内存占用与因子数无关），因子库本身只做"计算"，不做选股回测。
+
+### 18.4 诚实声明与局限
+
+1. **vwap 近似**：日线无真实 VWAP，用 成交额/成交量 近似——依赖 vwap 的 alpha（如 005/032/042/050/057 等）与 WorldQuant/qlib 基准存在口径差异；
+2. **rank/scale 为横截面口径**：与"单股票时间序列秩"的公开移植版数值不可直接对比（本实现按论文原义，见 18.2-1/2）；
+3. **advN 用成交量近似** AverageDollarVolume（成交额口径的 adv 未实现）；
+4. **19 个行业/市值依赖 alpha 本步未接入数据**（无行业分类与市值数据源），输出为 NaN；接口（`industry`/`cap` 参数）已就绪，待数据补齐后即插即用；
+5. **因子有效性未检验**：本步交付的是"因子库 + 计算正确性验证 + 覆盖率统计"，不做 IC/分层回测——哪些 alpha 在 A 股有效、方向如何，属于第 6 步"因子检验流程"的后续课题（且 101 个 alpha 同时检验存在严重多重比较/数据挖掘风险，须预留严格纪律，见第 8 章 8.6 节与 quant-factor-research.md 第 5 节）；
+6. 幸存者偏差与 qfq 快照口径沿用第 6/17 章声明（当前成分股快照、前复权活数据）。
+
+### 18.5 交付与复现
+
+- 交付：`scripts/alpha_factors.py`（Alpha101 × 101 + Alpha158 × 158 + selftest + compute CLI）+ 本章 + `output/factors/`（400 只抽样演示的 `alpha101_latest.csv` / `alpha158_latest.csv` / `*_coverage_summary.csv`）；
+- 复现命令见文末附录"开源经典因子库移植"段；自检随时可跑 `python scripts/alpha_factors.py selftest`。
+
+---
+
 ## 附录：复现命令
 
 ```bash
@@ -2106,6 +2180,13 @@ python scripts/pool_walkforward.py selftest               # 矩阵引擎 vs 逐�
 python scripts/pool_walkforward.py run                    # 全池 walk-forward（256 组合 × 4 折，默认小数股全仓口径）
 python scripts/pool_walkforward.py run --grid ndlr_small --no-plot   # 小网格调试
 python scripts/pool_backtest.py backtest --pool full_a --strategies n_day_low_reversal --frac-only   # 全池逐票口径对照（可选）
+
+# 开源经典因子库移植（第 18 章全部数据的来源；issue #36）
+python scripts/alpha_factors.py selftest                  # 合成数据自检（不访问网络）：截断一致性/未来扰动/停牌缺口/手工精确值
+python scripts/alpha_factors.py info                      # 因子清单与数据要求（101 + 158、行业/市值依赖清单）
+python scripts/alpha_factors.py compute --pool full_a --source tsp --max-stocks 400   # 全 A 池导入（复用 screener 快照键缓存）后对前 400 只计算
+python scripts/alpha_factors.py compute --no-fetch --max-stocks 400 --datadir data/daily   # 复用已有导入缓存（跳过拉取/导入）
+python scripts/alpha_factors.py compute --symbols 000001 600519 --only 158             # 指定股票 / 只算 Alpha158
 
 # 第 7 步日内原型（第 10 章全部数据的来源）：拉取 5 分钟线并记录覆盖范围，然后回测
 python scripts/intraday_backtest.py fetch                  # 拉取 data/minute/<代码>_5min.csv + coverage_5min.csv

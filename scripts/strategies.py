@@ -445,13 +445,227 @@ class NDayLowReversalStrategy(Strategy):
 
 
 # ---------------------------------------------------------------------------
+# 超跌反转（TSP 开源策略种子 oversold_volume_reversal 的移植）
+# ---------------------------------------------------------------------------
+
+class OversoldVolumeReversalStrategy(Strategy):
+    """超跌反转：深跌后放量阳线确认的反转买点；5 日动量转正离场。
+
+    移植自 TSP 平台策略种子 ``oversold_volume_reversal``（"超跌放量反转，
+    新低反转的增强版（自主设计 v1）"），本仓库适配要点（TSP 原语义见种子
+    文件注释）：
+    - **入场**（t 日收盘，全部满足才触发）：
+      1. 深跌：``close[t-1] / close[t-lookback] - 1 <= max_return``
+         （TSP 同口径：昨收相对 lookback 日前收盘的区间收益；max_return
+         以百分数注册，内部 /100）；
+      2. 量比：``volume[t] / mean(volume[t-5..t-1]) >= vol_ratio_min``
+         （TSP vol_ratio_5d 同口径：前 5 日均量，不含当日）；
+      3. 阳线：``close[t] > close[t-1]``（TSP require_bullish 同口径，
+         收盘高于昨收）。
+    - **离场**（任一触发）：
+      1. 5 日动量转正：``close[t] / close[t-5] - 1 > 0``（TSP 的
+         signal_ovr_done，"反转完成退出"）；
+      2. 止损：收盘 <= 入场参考价 × (1 + stop_loss)（入场参考价取 t+1 日
+         开盘——本仓库引擎 t 日信号 t+1 开盘成交；默认 -8%）；
+      3. 最长持有到期（默认 20 个交易日）。
+    - 引擎口径与其余策略一致：t 日收盘信号在 t+1 日开盘成交，止损以收盘价
+      判定、下一开盘价成交（跳空风险如实保留）。
+
+    参考来源：
+    - TSP 平台自定义策略种子（本机落盘副本）：
+      D:\\tsp-data\\strategies\\custom\\oversold_volume_reversal.py；
+    - TSP 项目仓库: https://github.com/chenjifengtrading/tick-stock-panel
+    """
+
+    name = "oversold_volume_reversal"
+    params = {
+        "lookback": ParamSpec(15, int, min=2, max=200, help="深跌回看窗口（交易日，TSP 种子默认 15）"),
+        "max_return": ParamSpec(-30.0, float, min=-95.0, max=0.0, help="区间收益上限（%，默认 -30：15 日跌超 30% 才入场）"),
+        "vol_ratio_min": ParamSpec(1.5, float, min=0.0, max=50.0, help="最低量比（当日量/前5日均量）"),
+        "require_bullish": ParamSpec(True, bool, help="要求当日阳线（收盘>昨收）"),
+        "stop_loss": ParamSpec(-0.08, float, min=-0.5, max=0.0, help="止损线（相对入场价，负值；0=关闭）"),
+        "max_hold_days": ParamSpec(20, int, min=0, max=500, help="最长持有交易日（0=关闭）"),
+    }
+    sources = [
+        "TSP 平台自定义策略种子 oversold_volume_reversal（本机 D:\\tsp-data\\strategies\\custom 落盘副本）",
+        "TSP 项目仓库: https://github.com/chenjifengtrading/tick-stock-panel",
+    ]
+
+    @property
+    def warmup(self) -> int:
+        return int(self._values["lookback"]) + 30  # TSP required_warmup_bars 同口径
+
+    def positions(self, df: pd.DataFrame) -> np.ndarray:
+        close = df["close"].values
+        open_ = df["open"].values
+        volume = (df["volume"].values if "volume" in df.columns
+                  else np.full(len(df), np.nan))
+        n = len(df)
+        lookback = int(self._values["lookback"])
+        max_ret = float(self._values["max_return"]) / 100.0
+        vol_min = float(self._values["vol_ratio_min"])
+        stop = float(self._values["stop_loss"])
+        max_hold = int(self._values["max_hold_days"])
+        require_bull = bool(self._values["require_bullish"])
+
+        # 区间收益 = 昨收 / lookback 日前收盘 - 1（TSP 同口径）
+        past = pd.Series(close).shift(1).values
+        base = pd.Series(close).shift(lookback).values
+        with np.errstate(divide="ignore", invalid="ignore"):
+            window_ret = np.where(base > 0, past / base - 1.0, np.nan)
+        # 量比 = 当日成交量 / 前 5 日均量（不含当日，TSP vol_ratio_5d 同口径）
+        vol_prev_mean = pd.Series(volume).rolling(5).mean().shift(1).values
+        with np.errstate(divide="ignore", invalid="ignore"):
+            vol_ratio = volume / vol_prev_mean
+        # 5 日动量（TSP momentum_5d 同口径：5 日前收盘为基）
+        mom5 = pd.Series(close).shift(5).values
+        with np.errstate(divide="ignore", invalid="ignore"):
+            momentum_5d = np.where(mom5 > 0, close / mom5 - 1.0, np.nan)
+
+        pos = np.full(n, np.nan)
+        state = 0.0
+        entry_t = -1
+        entry_ref = np.nan  # 入场参考价 = 信号次日开盘（止损基准）
+        for t in range(n):
+            ready = (t >= lookback and np.isfinite(close[t])
+                     and np.isfinite(window_ret[t]))
+            if not ready:
+                continue
+            if state == 0.0:
+                cond = window_ret[t] <= max_ret
+                cond = cond and np.isfinite(vol_ratio[t]) and vol_ratio[t] >= vol_min
+                if require_bull:
+                    cond = cond and t > 0 and close[t] > close[t - 1]
+                if cond and np.isfinite(open_[t]):
+                    state = 1.0
+                    entry_t = t
+                    # 引擎在 t+1 开盘成交；末日无次日开盘时退化为 t 日收盘
+                    entry_ref = open_[t + 1] if (
+                        t + 1 < n and np.isfinite(open_[t + 1])) else close[t]
+            else:
+                mom_done = (np.isfinite(momentum_5d[t]) and momentum_5d[t] > 0.0)
+                stop_hit = stop < 0.0 and close[t] <= entry_ref * (1.0 + stop)
+                hold_hit = max_hold > 0 and t - entry_t >= max_hold
+                if mom_done or stop_hit or hold_hit:
+                    state = 0.0
+                    entry_t = -1
+                    entry_ref = np.nan
+            pos[t] = state
+        return pos
+
+
+# ---------------------------------------------------------------------------
+# 单吊王通道（TSP 开源策略种子 dandiao_channel 的移植）
+# ---------------------------------------------------------------------------
+
+class DandiaoChannelStrategy(Strategy):
+    """单吊王通道：布林 + MACD + 唐奇安通道多指标分级共振，≥N 指标确认才买。
+
+    移植自 TSP 平台策略种子 ``dandiao_channel``（"单吊王通道 — 多指标分级
+    共振，半岛路单吊王 11.16 视频拆解的可回测版"），本仓库适配要点：
+    - **入场**（t 日收盘，三个信号合计 >= confirm 才触发）：
+      1. 布林带回升：``close[t-1] <= boll_lower[t-1] 且 close[t] >
+         boll_lower[t]``（布林 20 日、2.0 倍总体标准差，TSP matrix_feature
+         默认口径）；
+      2. MACD 金叉：DIF（EMA12-EMA26）自 0 轴下方上穿 0 轴
+         （``dif[t-1] <= 0 且 dif[t] > 0``，标准 MACD 12/26 口径）；
+      3. 唐奇安通道下轨支撑：``close[t-1] <= don_lo[t-1] 且 close[t] >
+         don_lo[t]``（don_lo = chan 日最低价滚动最小值，含当日）。
+    - **离场**（任一触发）：止损（默认 -8%）与最长持有到期（默认 20 个
+      交易日）；TSP 种子无主动离场信号（EXIT_SIGNALS 为空），本仓库照搬。
+    - 引擎口径与其余策略一致：t 日收盘信号在 t+1 日开盘成交，止损以收盘价
+      判定、下一开盘价成交（跳空风险如实保留）。
+
+    参考来源：
+    - TSP 平台自定义策略种子（本机落盘副本）：
+      D:\\tsp-data\\strategies\\custom\\dandiao_channel.py；
+    - TSP 项目仓库: https://github.com/chenjifengtrading/tick-stock-panel
+    """
+
+    name = "dandiao_channel"
+    params = {
+        "confirm": ParamSpec(2, int, min=1, max=3, help="共振确认数（≥N 个信号才买；TSP 全期回测最优为 3）"),
+        "chan": ParamSpec(20, int, min=5, max=120, help="唐奇安通道天数（TSP 种子默认 20）"),
+        "stop_loss": ParamSpec(-0.08, float, min=-0.5, max=0.0, help="止损线（相对入场价，负值；0=关闭）"),
+        "max_hold_days": ParamSpec(20, int, min=0, max=500, help="最长持有交易日（0=关闭）"),
+    }
+    sources = [
+        "TSP 平台自定义策略种子 dandiao_channel（本机 D:\\tsp-data\\strategies\\custom 落盘副本）",
+        "TSP 项目仓库: https://github.com/chenjifengtrading/tick-stock-panel",
+    ]
+
+    @property
+    def warmup(self) -> int:
+        # TSP required_warmup_bars=60；布林 20 / MACD 26 / 唐奇安 chan 全覆盖
+        return max(int(self._values["chan"]), 60)
+
+    def positions(self, df: pd.DataFrame) -> np.ndarray:
+        close = df["close"].values
+        open_ = df["open"].values
+        low = (df["low"].values if "low" in df.columns
+               else np.full(len(df), np.nan))
+        n = len(df)
+        confirm = int(self._values["confirm"])
+        chan = int(self._values["chan"])
+        stop = float(self._values["stop_loss"])
+        max_hold = int(self._values["max_hold_days"])
+
+        # 布林带 20 日 / 2.0 倍总体标准差（TSP matrix_feature 默认口径）
+        mid = pd.Series(close).rolling(20).mean().values
+        std = pd.Series(close).rolling(20).std(ddof=0).values
+        boll_lower = mid - 2.0 * std
+        # MACD DIF = EMA12 - EMA26（标准 MACD 口径）
+        ema12 = pd.Series(close).ewm(span=12, adjust=False).mean().values
+        ema26 = pd.Series(close).ewm(span=26, adjust=False).mean().values
+        dif = ema12 - ema26
+        # 唐奇安通道：chan 日最低价滚动最小值（含当日）
+        don_lo = pd.Series(low).rolling(chan).min().values
+
+        # 信号1: 布林带下轨回升 / 信号2: DIF 上穿 0 轴 / 信号3: 通道下轨支撑
+        pc = pd.Series(close).shift(1).values
+        pd_ = pd.Series(dif).shift(1).values
+        pl = pd.Series(boll_lower).shift(1).values
+        pdon = pd.Series(don_lo).shift(1).values
+        boll_buy = (pc <= pl) & (close > boll_lower)
+        macd_buy = (pd_ <= 0) & (dif > 0)
+        ch_buy = (pc <= pdon) & (close > don_lo)
+        buy_score = boll_buy.astype(int) + macd_buy.astype(int) + ch_buy.astype(int)
+
+        ready = ~np.isnan(boll_lower) & ~np.isnan(dif) & ~np.isnan(don_lo)
+        pos = np.full(n, np.nan)
+        state = 0.0
+        entry_t = -1
+        entry_ref = np.nan  # 入场参考价 = 信号次日开盘（止损基准）
+        for t in range(n):
+            if not ready[t]:
+                continue
+            if state == 0.0:
+                if buy_score[t] >= confirm and np.isfinite(open_[t]):
+                    state = 1.0
+                    entry_t = t
+                    # 引擎在 t+1 开盘成交；末日无次日开盘时退化为 t 日收盘
+                    entry_ref = open_[t + 1] if (
+                        t + 1 < n and np.isfinite(open_[t + 1])) else close[t]
+            else:
+                stop_hit = stop < 0.0 and close[t] <= entry_ref * (1.0 + stop)
+                hold_hit = max_hold > 0 and t - entry_t >= max_hold
+                if stop_hit or hold_hit:
+                    state = 0.0
+                    entry_t = -1
+                    entry_ref = np.nan
+            pos[t] = state
+        return pos
+
+
+# ---------------------------------------------------------------------------
 # 策略注册表
 # ---------------------------------------------------------------------------
 
 REGISTRY: dict[str, type[Strategy]] = {
     cls.name: cls
     for cls in (MACrossStrategy, RSIReversalStrategy, BollingerReversionStrategy,
-                MomentumStrategy, NDayLowReversalStrategy)
+                MomentumStrategy, NDayLowReversalStrategy,
+                OversoldVolumeReversalStrategy, DandiaoChannelStrategy)
 }
 
 ALIASES = {"ma": "ma_cross"}

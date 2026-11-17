@@ -27,6 +27,10 @@
     # 2) 因子计算 + 月度 Top-N 回测（默认动量、短期反转与低波动各一组）
     python scripts/screener.py backtest
 
+    # 3) 每日策略信号扫描：三大已验证策略（超跌反转/新低反转/单吊王通道）
+    #    最新一个交易日的入场信号清单，与三因子 latest_picks_*.csv 并列输出
+    python scripts/screener.py scan
+
 数据坑与口径（详见 docs/optimization-log.md 第 8 章）：
   1. **停牌**：akshare 日线只返回有交易的日期，停牌日缺失 → 收盘价前向
      填充（只在该股票自身数据范围内）；调仓日若目标股票 t+1 无开盘价
@@ -101,6 +105,7 @@ from backtest import (  # noqa: E402
     load_benchmark,
     standardize_stock,
 )
+from strategies import create_strategy  # noqa: E402
 
 # 沪深300 + 中证500（两指数成分互不重叠）；全 A 池见 --pool full_a
 POOL_INDEXES = ["000300", "000905"]
@@ -1233,6 +1238,165 @@ def _fmt_pct(x: float | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 每日策略信号扫描（issue #45：已验证策略加入每日选股管线）
+# ---------------------------------------------------------------------------
+
+# 三大已验证策略（TSP 引擎 2022-01-01 ~ 2026-11-12 全期横截面回测验证，
+# 证据与口径见 docs/optimization-log.md 第 20 章）。每项为运行时参数覆盖：
+# oversold_volume_reversal 的 TSP 默认参数即验证最优（无需覆盖）；
+# n_day_low_reversal 全期最优量比门槛 2.5（TSP 种子默认 1.5）；
+# dandiao_channel 全期唯一正收益档为 confirm=3（TSP 种子默认 2）。
+SCAN_STRATEGY_PARAMS = {
+    "oversold_volume_reversal": {},
+    "n_day_low_reversal": {"vol_ratio_min": 2.5},
+    "dandiao_channel": {"confirm": 3},
+}
+
+# TSP 种子的每日选股上限（limit），对应各策略 latest_picks 清单长度
+SCAN_TOP_N = {"oversold_volume_reversal": 100,
+              "n_day_low_reversal": 100, "dandiao_channel": 50}
+
+SCAN_LABELS = {"oversold_volume_reversal": "超跌反转",
+               "n_day_low_reversal": "新低反转",
+               "dandiao_channel": "单吊王通道"}
+
+# TSP 种子评分权重（scoring，按成分的横截面 z 分加权）。
+# 换手率（turnover_rate）不在本仓库日线 CSV 中，oversold_volume_reversal
+# 的 0.4/0.4/0.2 权重按可用分量重新归一为 0.5/0.5，如实声明口径差异。
+SCAN_SCORE_WEIGHTS = {
+    "oversold_volume_reversal": {"momentum_5d": 0.5, "vol_ratio_5d": 0.5},
+    "n_day_low_reversal": {"change_pct": 0.4, "momentum_5d": 0.3,
+                           "vol_ratio_5d": 0.3},
+    "dandiao_channel": {"change_pct": 0.4, "momentum_5d": 0.3,
+                        "vol_ratio_5d": 0.3},
+}
+
+
+def _last_day_score_components(df: pd.DataFrame) -> dict[str, float]:
+    """最后一行收盘的评分成分（与 TSP scoring 同口径）。"""
+    close = df["close"].to_numpy(float)
+    volume = (df["volume"].to_numpy(float) if "volume" in df.columns
+              else np.full(len(df), np.nan))
+    out: dict[str, float] = {}
+    if len(close) >= 2 and close[-2] > 0:
+        out["change_pct"] = float(close[-1] / close[-2] - 1.0)
+    if len(close) >= 6 and close[-6] > 0:
+        out["momentum_5d"] = float(close[-1] / close[-6] - 1.0)
+    vol_prev = volume[-6:-1] if len(volume) >= 6 else volume[:-1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = volume[-1] / float(np.mean(vol_prev)) if vol_prev.size else np.nan
+    if np.isfinite(ratio):
+        out["vol_ratio_5d"] = float(ratio)
+    return out
+
+
+def strategy_today_entries(dfs: dict[str, pd.DataFrame],
+                           names: dict[str, str],
+                           strategy_name: str,
+                           top_n: int) -> tuple[pd.Timestamp | None, int,
+                                                list[dict]]:
+    """一个策略的"最新交易日新入场"清单。
+
+    dfs: symbol → 标准化日线（date/open/close/high/low/volume，个股自身
+    交易日口径，不跨股票填充——与 TSP 种子信号口径一致）。扫描日 = 全部
+    股票最新交易日的最大值；只有当日有行情的股票（自身最后交易日 == 扫描日）
+    才参与当日清单，最后交易日早于扫描日的股票（停牌/数据滞后）不入选，
+    保证"最新一期 picks"全部是扫描日当天的新信号。
+
+    信号复用 scripts/strategies.py 的 positions()（与回测引擎同源）：
+    当日新入场 = pos[-1] == 1 且 pos[-2] != 1。触发股按 TSP scoring 的
+    横截面 z 分加权排序，取前 top_n。返回 (扫描日, 当日触发总数, 清单
+    rows)，rows 为 [股票代码, 股票名称] 字典（排序序即入选序）。
+    """
+    if not dfs:
+        return None, 0, []
+    strategy = create_strategy(strategy_name, **SCAN_STRATEGY_PARAMS[strategy_name])
+    scan_date = max(df["date"].max() for df in dfs.values())
+    triggered: list[tuple[str, dict[str, float]]] = []
+    for symbol, df in dfs.items():
+        if df.empty or df["date"].max() < scan_date:
+            continue  # 扫描日无行情（停牌/数据滞后），不是当日新信号
+        pos = strategy.positions(df)
+        if len(pos) < 2 or not (pos[-1] == 1.0 and pos[-2] != 1.0):
+            continue
+        triggered.append((symbol, _last_day_score_components(df)))
+
+    # TSP scoring：成分横截面 z 分加权；std 为 0 的成分记 0 贡献
+    weights = SCAN_SCORE_WEIGHTS[strategy_name]
+    n_triggered = len(triggered)
+    rows = []
+    if triggered:
+        keys = list(weights)
+        values = {k: np.array([c.get(k, np.nan) for _, c in triggered])
+                  for k in keys}
+        zs = {}
+        for k in keys:
+            v = values[k]
+            has = np.isfinite(v).any()
+            mu = np.nanmean(v) if has else 0.0
+            sd = np.nanstd(v) if has else 0.0
+            zs[k] = (v - mu) / sd if np.isfinite(sd) and sd > 0 \
+                else np.zeros(len(v))
+        scored = []
+        for i, (symbol, comp) in enumerate(triggered):
+            score = float(sum(weights[k] * zs[k][i]
+                              if np.isfinite(zs[k][i]) else 0.0
+                              for k in keys))
+            scored.append((score, symbol))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        rows = [{"股票代码": s, "股票名称": names.get(s, "")} for _, s in scored[:top_n]]
+    return scan_date, n_triggered, rows
+
+
+def run_scan(symbols: list[str], names: dict[str, str],
+             args: argparse.Namespace) -> None:
+    """每日策略信号扫描：读个股 CSV、逐策略取最新交易日新入场清单并落盘。
+
+    输出（output/screener/）：latest_picks_<策略名>.csv（股票代码+中文名称
+    两列，与三因子 latest_picks_*.csv 同格式并列），并在控制台打印摘要。
+    """
+    dfs: dict[str, pd.DataFrame] = {}
+    skipped = 0
+    for symbol in symbols:
+        csv_path = Path(args.datadir) / f"{symbol}_{args.adjust}.csv"
+        if not csv_path.exists():
+            skipped += 1
+            continue
+        try:
+            df = standardize_stock(pd.read_csv(csv_path))
+        except Exception:  # noqa: BLE001 单票损坏跳过
+            print(f"[warn] {symbol}: CSV 读取失败，跳过", file=sys.stderr)
+            skipped += 1
+            continue
+        if args.end:
+            df = df[df["date"] <= pd.Timestamp(args.end)]
+        if not df.empty:
+            dfs[symbol] = df
+    if not dfs:
+        raise RuntimeError("扫描无可用日线数据：请先运行 fetch 拉取日线")
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    for name in args.strategies:
+        top_n = args.top_n if args.top_n is not None else SCAN_TOP_N[name]
+        scan_date, n_triggered, rows = strategy_today_entries(
+            dfs, names, name, top_n)
+        label = SCAN_LABELS[name]
+        out_path = outdir / f"latest_picks_{name}.csv"
+        pd.DataFrame(rows, columns=["股票代码", "股票名称"]).to_csv(
+            out_path, index=False, encoding="utf-8-sig")
+        shown = "全部" if n_triggered <= top_n else f"前 {top_n}"
+        print(f"\n最新一期 {label}（扫描日 {scan_date.date() if scan_date else '—'}，"
+              f"当日新入场 {n_triggered} 只，输出{shown}，按策略评分排序）:")
+        for i, row in enumerate(rows[:20], 1):
+            print(f"  {i:>2}. {row['股票代码']} {row['股票名称']}")
+        if len(rows) > 20:
+            print(f"  … 共 {len(rows)} 只，完整清单见 {out_path}")
+    if skipped:
+        print(f"[warn] {skipped} 只股票无日线 CSV，已跳过", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # 自检（合成数据，不访问网络）
 # ---------------------------------------------------------------------------
 
@@ -1403,8 +1567,100 @@ def self_test() -> None:
     assert eq_rev[1] == 10000.0 and eq_rev[2] == 10000.0, \
         f"执行日前的净值应为全现金 10000，实际 {eq_rev[1]}, {eq_rev[2]}"
 
+    # 7) 每日策略信号扫描（issue #45）：三大已验证策略的末日入场识别、
+    #    扫描日过滤（最后交易日早于扫描日的股票排除）与评分排序
+    rng2 = np.random.default_rng(3)
+    dates200 = pd.date_range("2024-01-01", periods=200, freq="B")
+
+    def scan_df(close, open_, vol=None, low=None) -> pd.DataFrame:
+        out = pd.DataFrame({"date": dates200[:len(close)], "open": open_,
+                            "close": close})
+        out["high"] = close * 1.01
+        out["low"] = low if low is not None else close * 0.99
+        if vol is not None:
+            out["volume"] = vol
+        return out
+
+    # 7a) 超跌反转：崩溃于 last-4（腰斩），持平 3 天，末日 +1% 阳线、
+    #     量比 3.0 → 末日入场（窗口收益 ≈ -50% ≤ -30%）
+    base_o = 100 * np.cumprod(1.0 + 0.0005 + 0.0005 * rng2.standard_normal(200))
+    close_o = base_o.copy()
+    close_o[-4:] = [base_o[-5] * 0.5, base_o[-5] * 0.5, base_o[-5] * 0.5,
+                    base_o[-5] * 0.5 * 1.01]
+    open_o = base_o * 0.999
+    open_o[-4:] = [base_o[-5], base_o[-5] * 0.5, base_o[-5] * 0.5,
+                   base_o[-5] * 0.5]
+    vol_o = np.full(200, 1e6)
+    vol_o[-1] = 3e6
+    df_ovr = scan_df(close_o, open_o, vol_o)
+
+    # 7b) 新低反转：60 日收盘新低 + 末日阳线 + 量比 3.0（>= 验证门槛 2.5）
+    #     → 末日入场；量比 2.0 的对照股不得入选（验证参数覆盖生效）
+    close_n = np.full(200, 100.0)
+    open_n = np.full(200, 100.5)  # 平时阴线，末日阳线
+    close_n[-1] = 90.0
+    open_n[-1] = 89.5
+    vol_n = np.full(200, 1e6)
+    vol_n[-1] = 3e6
+    df_ndlr = scan_df(close_n, open_n, vol_n)
+    close_n2, open_n2, vol_n2 = close_n.copy(), open_n.copy(), vol_n.copy()
+    vol_n2[-1] = 2e6  # 量比 2.0 < 2.5 → 不应触发
+    df_ndlr2 = scan_df(close_n2, open_n2, vol_n2)
+
+    # 7c) 单吊王通道（confirm=3 验证参数）：崩溃日收在 20 日最低并跌破布林
+    #     下轨，末日 +10% 回升且 DIF 上穿 0 → 三信号共振末日入场
+    close_d = 100 * np.cumprod(1.0 + 0.0003 * rng2.standard_normal(170))
+    close_d = np.concatenate([close_d, close_d[-1] * np.ones(28)])
+    close_d = np.append(close_d, [close_d[-1] * 0.95, close_d[-1] * 0.95 * 1.10])
+    low_d = close_d * 0.995
+    low_d[198] = close_d[198]
+    open_d = close_d * 0.998
+    open_d[198] = close_d[197]
+    df_dd = scan_df(close_d, open_d, low=low_d)
+
+    # 7d) 负对照：平稳上行股不得触发任何策略；末行缺失（数据滞后 1 日）
+    #     的"超跌"股即使自身上一日触发也不得入选当日清单
+    base_p = 100 * np.cumprod(1.0 + 0.001 + 0.0005 * rng2.standard_normal(200))
+    df_plain = scan_df(base_p, base_p * 0.999, np.full(200, 1e6))
+    df_stale = df_ovr.iloc[:-1].copy()  # 最后交易日 = 扫描日前一日
+
+    dfs = {"000001": df_ovr, "000002": df_ndlr, "000003": df_ndlr2,
+           "000004": df_dd, "000005": df_plain, "000006": df_stale}
+    names = {"000001": "超跌股", "000002": "新低股", "000003": "新低对照",
+             "000004": "单吊股", "000005": "平稳股", "000006": "滞后股"}
+    scan_d, n_ovr, rows_ovr = strategy_today_entries(
+        dfs, names, "oversold_volume_reversal", 100)
+    assert scan_d == dates200[-1], f"扫描日应为末日 {dates200[-1]}，实际 {scan_d}"
+    assert n_ovr == 1 and [r["股票代码"] for r in rows_ovr] == ["000001"], \
+        f"超跌反转应只命中 000001，实际 {rows_ovr}"
+    _, _, rows_ndlr = strategy_today_entries(dfs, names,
+                                             "n_day_low_reversal", 100)
+    assert [r["股票代码"] for r in rows_ndlr] == ["000002"], \
+        f"新低反转应只命中 000002（量比 2.0 对照被 2.5 门槛排除），实际 {rows_ndlr}"
+    _, _, rows_dd = strategy_today_entries(dfs, names, "dandiao_channel", 50)
+    assert [r["股票代码"] for r in rows_dd] == ["000004"], \
+        f"单吊王通道应只命中 000004，实际 {rows_dd}"
+
+    # 7e) 评分排序：两只同日触发的超跌股，涨幅与量比更高者排前
+    close_o2 = base_o.copy()
+    close_o2[-4:] = [base_o[-5] * 0.5, base_o[-5] * 0.5, base_o[-5] * 0.5,
+                     base_o[-5] * 0.5 * 1.05]
+    open_o2 = base_o * 0.999
+    open_o2[-4:] = [base_o[-5], base_o[-5] * 0.5, base_o[-5] * 0.5,
+                    base_o[-5] * 0.5]
+    vol_o2 = np.full(200, 1e6)
+    vol_o2[-1] = 5e6
+    df_ovr2 = scan_df(close_o2, open_o2, vol_o2)
+    dfs2 = {"000001": df_ovr, "000007": df_ovr2}
+    names2 = {"000001": "低分股", "000007": "高分股"}
+    _, n2, rows_sorted = strategy_today_entries(dfs2, names2,
+                                                "oversold_volume_reversal", 100)
+    assert n2 == 2 and [r["股票代码"] for r in rows_sorted] == \
+        ["000007", "000001"], \
+        f"评分排序应为 000007（涨幅/量比更高）在前，实际 {rows_sorted}"
+
     print("[ok] self_test 通过：因子计算、无未来函数、停牌填充、月末识别、"
-          "迷你回测、成本口径与停牌执行日断言全部成立")
+          "迷你回测、成本口径、停牌执行日与每日策略信号扫描断言全部成立")
 
 
 # ---------------------------------------------------------------------------
@@ -1509,6 +1765,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     sub.add_parser("selftest", help="只运行合成数据上的算法自检（不拉数据）")
 
+    p_scan = sub.add_parser(
+        "scan", help="每日策略信号扫描：三大已验证策略最新交易日入场清单")
+    p_scan.add_argument("--pool", choices=["cs800", "full_a"], default=None,
+                        help="股票池：cs800=沪深300+中证500（默认）；"
+                             "full_a=全 A 市场约 5900 只（本地 TSP 快照优先）")
+    p_scan.add_argument("--tsp-dir", default=TSP_DIR_DEFAULT,
+                        help=f"本机 TSP 数据目录（full_a 池），默认 {TSP_DIR_DEFAULT}")
+    p_scan.add_argument("--strategies",
+                        default="oversold_volume_reversal,"
+                                "n_day_low_reversal,dandiao_channel",
+                        help="扫描的策略，逗号分隔: oversold_volume_reversal"
+                             "（超跌反转）、n_day_low_reversal（新低反转）、"
+                             "dandiao_channel（单吊王通道）；参数取 TSP 全期"
+                             "回测验证值（见优化日志第 20 章）")
+    p_scan.add_argument("--top-n", type=int, default=None,
+                        help="每个策略输出清单长度，默认取 TSP 种子 limit"
+                             "（超跌/新低反转 100，单吊王通道 50）")
+    p_scan.add_argument("--end", default=None,
+                        help="数据截止日 YYYYMMDD，默认 None=使用本地 CSV 的"
+                             "全部数据（扫描日=最新交易日）")
+    p_scan.add_argument("--adjust", choices=["qfq", "hfq", "none"], default="qfq",
+                        help="复权方式: qfq 前复权(默认) / hfq / none")
+    p_scan.add_argument("--datadir", default="data/daily",
+                        help="日线 CSV 目录，默认 data/daily")
+    p_scan.add_argument("--outdir", default="output/screener",
+                        help="输出目录，默认 output/screener")
+    p_scan.add_argument("--retries", type=int, default=3,
+                        help="股票池拉取失败重试次数，默认 3")
+    p_scan.add_argument("--offline", action="store_true",
+                        help="股票池只用本地缓存，不访问网络")
+
     args = parser.parse_args(argv)
 
     if args.command == "backtest":
@@ -1520,6 +1807,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.min_bars is None:
             args.min_bars = max(args.mom_lookback, args.vol_window)
         if args.top_n <= 0:
+            parser.error("--top-n 必须为正整数")
+    if args.command == "scan":
+        names = [s.strip() for s in args.strategies.split(",") if s.strip()]
+        bad = [s for s in names if s not in SCAN_LABELS]
+        if bad:
+            parser.error(f"未知策略 {bad}，可选: {', '.join(sorted(SCAN_LABELS))}")
+        args.strategies = names
+        if args.top_n is not None and args.top_n <= 0:
             parser.error("--top-n 必须为正整数")
     if args.command == "fetch" and args.sleep <= 0:
         parser.error("--sleep 必须为正（勿对上游造成压力）")
@@ -1610,6 +1905,19 @@ def main(argv: list[str] | None = None) -> int:
                              args.max_stocks, offline=False,
                              prefer=args.prefer, source=args.source,
                              tsp_dir=args.tsp_dir)
+
+        if command == "scan":
+            pool = args.pool or "cs800"
+            universe = fetch_universe(offline=args.offline,
+                                      retries=args.retries, pool=pool,
+                                      tsp_dir=args.tsp_dir)
+            symbols = universe["symbol"].tolist()
+            names = dict(zip(universe["symbol"], universe["name"]))
+            print(f"[ok] 股票池: {len(symbols)} 只，扫描策略: "
+                  f"{', '.join(SCAN_LABELS[s] for s in args.strategies)}")
+            run_scan(symbols, names, args)
+            print(f"\n⚠ {DISCLAIMER}")
+            return 0
 
         # backtest
         pool = args.pool or "cs800"

@@ -1,7 +1,8 @@
-"""开源经典因子库移植：WorldQuant Alpha101 + Qlib Alpha158（量价部分）。
+"""开源经典因子库移植：WorldQuant Alpha101 + Qlib Alpha158（量价部分）+ 国泰君安 Alpha191。
 
-任务来源：GitHub issue #36（"扩大因子库"）。本模块把两个被广泛使用的开源
-因子库移植到本项目的数据口径（A 股 qfq 日线，OHLCV + 成交额）：
+任务来源：GitHub issue #36（"扩大因子库"）与 issue #46（"补全开源因子三件套：
+101+158+191"）。本模块把三个被广泛使用的开源因子库移植到本项目的数据口径
+（A 股 qfq 日线，OHLCV + 成交额）：
 
 1. **Alpha101**（Kakushadze 2016, "101 Formulaic Alphas"）：101 个公式化
    量价 alpha。其中 82 个只依赖 OHLCV（含 vwap/returns 派生量）；18 个
@@ -18,6 +19,17 @@
    qlib 的窗口内 OLS 定义（x 取窗口位置，最新值 x=窗口长度）、Corr 在
    任一侧滚动 std(ddof=1)≈0（atol 2e-5）时置 NaN、IdxMax/IdxMin 返回
    窗口内最大值/最小值的位置（1 起）。
+
+3. **Alpha191**（国泰君安 2017-06《基于短周期价量特征的多因子选股体系》，
+   短周期价量因子）：191 个因子，以 DolphinDB 官方模块 gtja191Alpha
+   v1.0.0（Apache-2.0）为移植基准。其中 186 个只依赖 OHLCV(+vwap)；
+   4 个（gtja075/149/181/182）依赖基准指数开/收盘；1 个（gtja030）依赖
+   Fama-French 三因子 MKT/SMB/HML——对应输入未提供时这些因子全为 NaN
+   （见 ALPHA191_NEEDS_INDEX / ALPHA191_NEEDS_FF3）。研报公式本身存在
+   缺项/歧义（MAX(A,5) 的滚动与逐元素含义、SMA 初值、Alpha165/183 的
+   SUMAC 与极值窗口等），本移植的逐条口径与对 DolphinDB 原版已知笔误
+   （alpha7/28/33/104/146/166/173/190 等）的修正清单见代码中 Alpha191
+   小节的注释，不把推断冒充研报原文。
 
 口径约定（与本项目其余部分一致，详见 docs/optimization-log.md 第 18 章）：
 - **无未来函数**：全部时间序列算子只使用当日及之前的信息（shift/rolling，
@@ -49,6 +61,12 @@
   https://github.com/microsoft/qlib/blob/main/qlib/contrib/data/loader.py
 - 公开参考实现（公式对照，未直接引用代码）：
   https://github.com/yli188/WorldQuant_alpha101_code
+- 国泰君安证券 (2017), 《基于短周期价量特征的多因子选股体系》（公开公式表
+  见 BigQuant 知识库《Alpha191 因子构建公式》）；
+- DolphinDB gtja191Alpha v1.0.0（Apache-2.0 License，移植基准）：
+  https://github.com/dolphindb/DolphinDBModules/tree/master/gtja191Alpha
+- 研报公式缺失/歧义清单参考：laozdao/dao-quant-research 的
+  M06-06-gtja191-formula-reference（逐条审核）。
 
 用法：
     python scripts/alpha_factors.py selftest   # 合成数据自检（不访问网络）
@@ -57,14 +75,19 @@
     python scripts/alpha_factors.py compute --symbols 000001 600519 600036 300750
     # 全 A 池：先经 screener.py 的 TSP parquet 导入，再对前 N 只计算
     python scripts/alpha_factors.py compute --pool full_a --source tsp --max-stocks 400
+    # 只算 Alpha191（--only 191；--index-csv 提供基准指数后 gtja075/149/181/182 才有值）
+    python scripts/alpha_factors.py compute --no-fetch --only 191 --max-stocks 400 \
+        --datadir data/daily --index-csv data/daily/000300_index.csv
     # 复用已有导入缓存（--no-fetch 跳过拉取/导入，直接用 --datadir 下的 CSV）
     python scripts/alpha_factors.py compute --no-fetch --max-stocks 400 --datadir data/daily
 
 输出（output/factors/）：
     alpha101_latest.csv            每只股票最新一期的 101 个 alpha 值（股票 × 因子）
     alpha158_latest.csv            每只股票最新一期的 158 个 Alpha158 特征
+    alpha191_latest.csv            每只股票最新一期的 191 个 GTJA 短周期因子
     alpha101_coverage_summary.csv  每个 alpha 的有效值占比与描述统计（因子 × 指标）
     alpha158_coverage_summary.csv  每个 Alpha158 特征的有效值占比与描述统计
+    alpha191_coverage_summary.csv  每个 GTJA 因子的有效值占比与描述统计
 
 ⚠ 历史模拟回测结果不代表未来表现，不构成投资建议。
 """
@@ -406,11 +429,14 @@ def _tern(cond: pd.DataFrame, a, b) -> pd.DataFrame:
     """三元选择：cond 为真取 a，否则取 b；cond 为 NaN 处结果保持 NaN。
 
     a/b 可为 DataFrame 或标量（与论文的 ?: 语义一致，热身期不产生伪值）。
+    cond 可为 bool 或 0/1 浮点（NaN 表示未知）。
     """
     like = cond
     a_f = _as_frame(a, like).to_numpy(dtype=float)
     b_f = _as_frame(b, like).to_numpy(dtype=float)
-    out = np.where(cond.fillna(False).to_numpy(dtype=bool), a_f, b_f)
+    cond_arr = cond.to_numpy()
+    fill = 0.0 if np.issubdtype(cond_arr.dtype, np.floating) else False
+    out = np.where(cond.fillna(fill).to_numpy(dtype=bool), a_f, b_f)
     return pd.DataFrame(out, index=like.index, columns=like.columns).mask(
         cond.isna())
 
@@ -471,6 +497,9 @@ class _Ctx:
         self.industry = industry
         self.memo: dict = {}
         self._warned: set[str] = set()
+        # 强引用被 rank_of 缓存的临时 DataFrame：临时对象被 GC 后其 id()
+        # 会被复用，若只按 id 作缓存键会命中别的因子的过期结果。
+        self._rank_inputs: list[pd.DataFrame] = []
 
     @property
     def o(self) -> pd.DataFrame:
@@ -512,6 +541,7 @@ class _Ctx:
         return self.get(("adv", n), lambda: _ts_mean(self.v, n))
 
     def rank_of(self, frame: pd.DataFrame) -> pd.DataFrame:
+        self._rank_inputs.append(frame)
         return self.get(("rank", id(frame)), lambda: _rank_cs(frame))
 
     def rank(self, field: str) -> pd.DataFrame:
@@ -1628,6 +1658,1898 @@ def compute_alpha158(frames: dict[str, pd.DataFrame],
 
 
 # ---------------------------------------------------------------------------
+# Alpha191：国泰君安 191 个短周期价量因子
+# ---------------------------------------------------------------------------
+# 基准：DolphinDB 官方模块 gtja191Alpha v1.0.0（Apache-2.0），公式文本另与
+# 国泰君安研报《基于短周期价量特征的多因子选股体系》(2017-06) 的公开公式
+# 表（BigQuant 知识库版）逐条核对。原文本身存在缺项/歧义（如 MAX(A,5) 的
+# 滚动与逐元素含义、SMA 初值、Alpha165/183 的 SUMAC 与极值窗口），逐条
+# 按下面"口径约定"解决；与本移植不同的公开实现（DolphinDB 原版、其他
+# pandas 移植版）之间的分歧也逐条注明，不把推断冒充研报原文。
+#
+# 口径约定（GTJA191 专有，未列出的继承模块 docstring 的通用口径）：
+# - DELAY(X,N)=X 的 N 日前值；DELTA(X,N)=X−DELAY(X,N)；RET=close/lag1−1。
+# - RANK(X)：当日横截面升序分位秩，值域 (0,1]（(rank+1)/n，与 DolphinDB
+#   rowRank percent=true 同口径，并列取均值）。
+# - TSRANK(X,N)：当日 X 在最近 N 日内的 0 起整数升序名次（0=窗口最低，
+#   并列取 min 名次；DolphinDB mrank 同口径）。注意其值域为 [0,N−1]，
+#   不是分位——alpha117 的 (1−TSRANK) 结构依赖这一点。
+# - SUM/MEAN/STD/MAX/MIN/CORR/COVIANCE(X,N)：最近 N 个交易日（完整窗口，
+#   不足 N 日为 NaN）；STD/COV 用 ddof=1。
+# - MAX(A,B)/MIN(A,B)：逐元素取大/小。表 6 中形如 MAX(A,5)/MIN(A,12) 的
+#   数值第二参数按滚动 N 日极值实现（研报常见解读；DolphinDB 原版在
+#   alpha64/91/108/119/121/127/154 等处误用逐元素比较，本移植未跟随）。
+# - SMA(X,N,M)：通达信式递推 y[0]=x[0]、y[t]=(M·x[t]+(N−M)·y[t−1])/N。
+#   DolphinDB 用 ewmMean(adjust=true)，两者暖机段略有差异、指数收敛后
+#   一致；本移植用研报递推式。alpha81 按公式取 M=2（DolphinDB 误用 1/21）。
+# - WMA(X,N)：权重 1..N 的加权移动平均（最新权重 N；DolphinDB
+#   mavg(x,1..N) 同口径；研报附录"距今 i 天权重 0.9^i"未被 DolphinDB
+#   采用，本移植跟随基准实现并如实声明）。
+# - DECAYLINEAR(X,N)：权重 1..N（最新权重 N），同 Alpha101 的 decay_linear。
+# - COUNT(cond,N)/SUMIF(X,cond,N)：N 日内条件成立天数/满足条件的 X 求和。
+# - HIGHDAY/LOWDAY(X,N)：N 日窗口内最高/最低距今的天数（当日=0，并列取
+#   窗口内最先出现者，即 0 起 argmax/argmin 的镜像）。
+# - REGBETA(Y,X,N)：Y 对 X 的含截距滚动 OLS 斜率。alpha21/147 的 X 为
+#   SEQUENCE(N)（回归窗口按 X 长度取 N=6/12，研报缺第三参数）；alpha116
+#   补 SEQUENCE(20)。alpha149 在最近 252 日内筛选指数下跌日（指数当日
+#   收盘 < 前收盘）后对 (股票收益, 指数收益) 回归，配对样本 < 2 时为 NaN。
+# - SUMAC(X,N)：X 的 N 日滚动求和。alpha165/183 的 MAX/MIN 不带窗口，原
+#   式按全序列取极值；为满足本项目"无未来函数"约定，改为**截至当日**的
+#   扩展极值，并把整个极差除以 STD（研报括号缺省下 DolphinDB 只把 MIN
+#   项除以 STD，本移植按常见解读取 (MAX−MIN)/STD）。
+# - alpha143 的 SELF：递推初值 1.0，当日 CLOSE>DELAY(CLOSE,1) 时乘
+#   (CLOSE/DELAY(CLOSE,1)−1)，否则保持前值；停牌日输出 NaN 并保持状态。
+# - 数据需求：186 个因子只需 OHLCV(+vwap)；gtja075/149/181/182 需要基准
+#   指数开/收盘（BANCHMARKINDEXOPEN/CLOSE，本项目以单一指数序列近似，
+#   例如沪深 300）；gtja030 需要 Fama-French 三因子 MKT/SMB/HML。对应
+#   输入未提供时这些因子全为 NaN（与 Alpha101 的行业/市值因子同策略）。
+# - 尺度说明：vwap=amount/volume 沿用模块通用口径（本项目成交量单位为手，
+#   vwap 为元/手，约 100× 股价；alpha158 的 VWAP0≈112 即此口径）。研报
+#   原式把 VWAP 与价格直接混合的因子（如 alpha13/26/120/124/154/158）
+#   在本数据口径下会整体偏移，属已知尺度敏感（研报审核亦将其标为 D 类），
+#   如实保留公式、不擅自改单位。
+# - 已知的公式分歧（本移植选择）：alpha7 外层括号为 (RANK(MAX)+RANK(MIN))
+#   ×RANK(DELTA)（DolphinDB 丢括号变成 A+B×C）；alpha28 第二项分母
+#   MAX(HIGH,9)−TSMAX(LOW,9) 按笔误处理为 TSMAX(HIGH,9)−TSMIN(LOW,9)
+#   （DolphinDB 把 ×100 写进分母，未跟随）；alpha33 为 ((Σ240−Σ20)/220)
+#   （DolphinDB 丢括号）；alpha104 的 DELTA(CORR,5) 滞后 5（DolphinDB
+#   误用 4）；alpha146 按公式文本 = MEAN(A−B,20)·(A−B)/SMA(B²,60,1)
+#   （DolphinDB 丢 (A−B) 因子且分母用普通均值；另一公开移植把分母写成
+#   SMA((A−B)²,60,2)，均未跟随）；alpha166 分母按 DolphinDB 的字面解读
+#   19·18·(Σ(MEAN(R,20)²,20))^1.5（原式损坏不可唯一恢复）；alpha173 第三
+#   项按公式为 LOG(CLOSE) 的三重 SMA（DolphinDB 误用 close）；alpha190
+#   按 DolphinDB 的字面平方项 (A−B−2)²，分母按公式取 COUNT（DolphinDB
+#   误乘 0/1 向量 D）。
+#
+# 来源：
+# - 国泰君安证券 (2017), 《基于短周期价量特征的多因子选股体系》；
+# - DolphinDB gtja191Alpha v1.0.0（Apache-2.0 License）：
+#   https://github.com/dolphindb/DolphinDBModules/tree/master/gtja191Alpha
+# - 公式文本对照：BigQuant 知识库《Alpha191 因子构建公式》；
+#   研报公式缺失/歧义清单参考 laozdao/dao-quant-research 的逐条审核。
+
+ALPHA191_NAMES = [f"gtja{i:03d}" for i in range(1, 192)]
+
+# 依赖基准指数开/收盘的因子（BANCHMARKINDEXOPEN/CLOSE）
+ALPHA191_NEEDS_INDEX = {"gtja075", "gtja149", "gtja181", "gtja182"}
+# 依赖 Fama-French 三因子（MKT/SMB/HML）的因子
+ALPHA191_NEEDS_FF3 = {"gtja030"}
+# 仅依赖 OHLCV(+vwap) 的因子
+ALPHA191_OHLCV_ONLY = [
+    n for n in ALPHA191_NAMES
+    if n not in ALPHA191_NEEDS_INDEX and n not in ALPHA191_NEEDS_FF3
+]
+assert len(ALPHA191_OHLCV_ONLY) == 186, len(ALPHA191_OHLCV_ONLY)
+
+
+class _G191Ctx:
+    """Alpha191 计算上下文。
+
+    frames：open/high/low/close/volume/vwap/returns 宽表（日期 × 股票）；
+    index_close/index_open：可选，日期索引的基准指数收盘/开盘 Series
+    （gtja075/149/181/182 需要）；
+    mkt/smb/hml：可选，日期索引的 Fama-French 三因子 Series（gtja030 需要）。
+    memo 缓存滚动算子结果；get() 惰性求值公共子表达式。
+    """
+
+    def __init__(self, frames: dict[str, pd.DataFrame],
+                 index_close: pd.Series | None = None,
+                 index_open: pd.Series | None = None,
+                 mkt: pd.Series | None = None,
+                 smb: pd.Series | None = None,
+                 hml: pd.Series | None = None) -> None:
+        self.frames = frames
+        self._idx_close = _g191_series(index_close)
+        self._idx_open = _g191_series(index_open)
+        self._mkt = _g191_series(mkt)
+        self._smb = _g191_series(smb)
+        self._hml = _g191_series(hml)
+        self.memo: dict = {}
+        self._warned: set[str] = set()
+        # 强引用被 rank 缓存的临时 DataFrame（防 id() 复用串缓存，见 _Ctx）
+        self._rank_inputs: list[pd.DataFrame] = []
+
+    @property
+    def o(self) -> pd.DataFrame:
+        return self.frames["open"]
+
+    @property
+    def h(self) -> pd.DataFrame:
+        return self.frames["high"]
+
+    @property
+    def l(self) -> pd.DataFrame:
+        return self.frames["low"]
+
+    @property
+    def c(self) -> pd.DataFrame:
+        return self.frames["close"]
+
+    @property
+    def v(self) -> pd.DataFrame:
+        return self.frames["volume"]
+
+    @property
+    def vwap(self) -> pd.DataFrame:
+        return self.frames["vwap"]
+
+    @property
+    def ret(self) -> pd.DataFrame:
+        return self.frames["returns"]
+
+    def get(self, key, fn):
+        if key not in self.memo:
+            self.memo[key] = fn()
+        return self.memo[key]
+
+    def rank(self, frame: pd.DataFrame) -> pd.DataFrame:
+        self._rank_inputs.append(frame)
+        return self.get(("grank", id(frame)), lambda: _rank_cs(frame))
+
+    def amount(self) -> pd.DataFrame:
+        """AMOUNT = VOLUME × VWAP（研报口径，DolphinDB 同）。"""
+        return self.get(("amount",), lambda: self.v * self.vwap)
+
+    def adv(self, n: int) -> pd.DataFrame:
+        return self.get(("adv", n), lambda: _ts_mean(self.v, n))
+
+    def idx_close(self, who: str) -> pd.DataFrame:
+        if self._idx_close is None:
+            self.warn_missing(who, "基准指数收盘序列 (index_close)")
+            return _nan_like(self.c)
+        return _g191_broadcast(self._idx_close, self.c)
+
+    def idx_open(self, who: str) -> pd.DataFrame:
+        if self._idx_open is None:
+            self.warn_missing(who, "基准指数开盘序列 (index_open)")
+            return _nan_like(self.c)
+        return _g191_broadcast(self._idx_open, self.c)
+
+    def warn_missing(self, name: str, what: str) -> None:
+        if name not in self._warned:
+            print(f"[warn] {name} 需要 {what}，未提供输入 → 结果全为 NaN",
+                  file=sys.stderr)
+            self._warned.add(name)
+
+
+def _g191_series(s: pd.Series | None) -> pd.Series | None:
+    """把可选输入规范为按日期排序、去重的数值 Series。"""
+    if s is None:
+        return None
+    if isinstance(s, pd.DataFrame):
+        if s.shape[1] != 1:
+            raise ValueError("index/mkt/smb/hml 输入 DataFrame 只能有 1 列")
+        s = s.iloc[:, 0]
+    s = pd.to_numeric(s, errors="coerce")
+    return s[~s.index.duplicated(keep="last")].sort_index()
+
+
+def _g191_broadcast(s: pd.Series, like: pd.DataFrame) -> pd.DataFrame:
+    """把日期索引的公共序列（指数/三因子）按并集日历广播为宽表。"""
+    aligned = s.reindex(like.index)
+    return pd.DataFrame(np.repeat(aligned.to_numpy()[:, None],
+                                  like.shape[1], axis=1),
+                        index=like.index, columns=like.columns)
+
+
+# ---------------------------------------------------------------------------
+# Alpha191 时间序列算子（GTJA 口径）
+# ---------------------------------------------------------------------------
+
+def _g191_sma(x: pd.DataFrame, n: int, m: int) -> pd.DataFrame:
+    """SMA(X,N,M)：递推 y[0]=x[0]，y[t]=(M·x[t]+(N−M)·y[t−1])/N。"""
+    if not (1 <= m <= n):
+        raise ValueError(f"SMA 需要 1<=m<=n，得到 {n},{m}")
+    alpha = m / n
+
+    def fn(a: np.ndarray) -> np.ndarray:
+        out = np.full(len(a), np.nan)
+        if len(a) == 0:
+            return out
+        out[0] = a[0]
+        for t in range(1, len(a)):
+            out[t] = alpha * a[t] + (1.0 - alpha) * out[t - 1]
+        return out
+    return _map_cols(x, fn)
+
+
+def _g191_wma(x: pd.DataFrame, n: int) -> pd.DataFrame:
+    """WMA(X,N)：权重 1..N 的加权移动平均（最新权重 N，与 decay_linear 同）。"""
+    return _decay_linear(x, n)
+
+
+def _g191_tsrank(x: pd.DataFrame, n: int) -> pd.DataFrame:
+    """TSRANK(X,N)：当日 X 在最近 N 日内的 0 起升序名次（并列取 min）。
+
+    DolphinDB mrank(X, true, N) 同口径；完整窗口（不足 N 日 NaN）。
+    """
+    def fn(a: np.ndarray) -> np.ndarray:
+        out = np.full(len(a), np.nan)
+        if len(a) < n:
+            return out
+        win = np.lib.stride_tricks.sliding_window_view(a, n)
+        vals = (win < win[:, -1:]).sum(axis=1).astype(float)
+        vals[np.isnan(win).any(axis=1)] = np.nan
+        out[n - 1:] = vals
+        return out
+    return _map_cols(x, fn)
+
+
+def _g191_ts_argmax0(x: pd.DataFrame, n: int) -> pd.DataFrame:
+    """窗口内最大值位置（0 起、自窗口最旧端；并列取最先出现）。"""
+    def fn(a: np.ndarray) -> np.ndarray:
+        out = np.full(len(a), np.nan)
+        if len(a) < n:
+            return out
+        win = np.lib.stride_tricks.sliding_window_view(a, n)
+        vals = np.argmax(win, axis=1).astype(float)
+        vals[np.isnan(win).any(axis=1)] = np.nan
+        out[n - 1:] = vals
+        return out
+    return _map_cols(x, fn)
+
+
+def _g191_ts_argmin0(x: pd.DataFrame, n: int) -> pd.DataFrame:
+    def fn(a: np.ndarray) -> np.ndarray:
+        out = np.full(len(a), np.nan)
+        if len(a) < n:
+            return out
+        win = np.lib.stride_tricks.sliding_window_view(a, n)
+        vals = np.argmin(win, axis=1).astype(float)
+        vals[np.isnan(win).any(axis=1)] = np.nan
+        out[n - 1:] = vals
+        return out
+    return _map_cols(x, fn)
+
+
+def _g191_highday(x: pd.DataFrame, n: int) -> pd.DataFrame:
+    """HIGHDAY(X,N)：N 日最高距今的天数（当日=0）。"""
+    return (n - 1) - _g191_ts_argmax0(x, n)
+
+
+def _g191_lowday(x: pd.DataFrame, n: int) -> pd.DataFrame:
+    """LOWDAY(X,N)：N 日最低距今的天数（当日=0）。"""
+    return (n - 1) - _g191_ts_argmin0(x, n)
+
+
+def _g191_trend_slope(y: pd.DataFrame, n: int) -> pd.DataFrame:
+    """REGBETA(Y, SEQUENCE(N))：Y 对**窗口内位置 1..N** 的滚动 OLS 斜率。
+
+    每个窗口使用完整的 1..N 位置模板（与 DolphinDB linearTimeTrend 及
+    研报 SEQUENCE(N) 意图一致；qlib 的 Slope 同为位置回归，仿射变换不
+    影响斜率，直接复用其闭式）。完整窗口：不足 N 个交易日为 NaN。
+    """
+    def fn(a: np.ndarray) -> np.ndarray:
+        out = _qlib_slope_rsqr_resi(a, n)[0]
+        out[:n - 1] = np.nan
+        return out
+    return _map_cols(y, fn)
+
+
+def _g191_beta_selected(y: pd.DataFrame, x: pd.DataFrame, sel: pd.DataFrame,
+                        n: int) -> pd.DataFrame:
+    """REGBETA(FILTER(Y), FILTER(X), n)：窗口内选中日的含截距 OLS 斜率。
+
+    sel 为 0/1（NaN 行不选中）；窗口内选中配对 < 2 时 NaN。用于 alpha149。
+    """
+    y_arr = y.to_numpy(dtype=float)
+    x_arr = x.to_numpy(dtype=float)
+    sel_arr = sel.to_numpy(dtype=float)
+    t_total, n_cols = y_arr.shape
+    out = np.full((t_total, n_cols), np.nan)
+    if t_total < n:
+        return pd.DataFrame(out, index=y.index, columns=y.columns)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for t in range(n - 1, t_total):
+            ys = y_arr[t - n + 1:t + 1]
+            xs = x_arr[t - n + 1:t + 1]
+            ss = sel_arr[t - n + 1:t + 1]
+            mask = (ss == 1.0) & np.isfinite(ys) & np.isfinite(xs)
+            k = mask.sum(axis=0)
+            ok = k >= 2
+            if not ok.any():
+                continue
+            m = mask.astype(float)
+            sx = (xs * m).sum(axis=0)
+            sy = (ys * m).sum(axis=0)
+            sxy = (xs * ys * m).sum(axis=0)
+            sxx = (xs * xs * m).sum(axis=0)
+            num = k * sxy - sx * sy
+            den = k * sxx - sx * sx
+            beta = num / den
+            beta[~ok | (den <= 0)] = np.nan
+            out[t, ok] = beta[ok]
+    return pd.DataFrame(out, index=y.index, columns=y.columns)
+
+
+def _g191_regresi_ff3(ret: pd.DataFrame, mkt: pd.Series, smb: pd.Series,
+                      hml: pd.Series, like: pd.DataFrame,
+                      n: int) -> pd.DataFrame:
+    """alpha030：RET 对 [MKT,SMB,HML] 的含截距滚动 OLS 残差（最新一期）。
+
+    三因子为公共日度序列；逐股票、逐窗口用 lstsq 求解（仅 gtja030 使用，
+    提供三因子时才计算，规模可控）。
+    """
+    idx = like.index
+    m = pd.concat([mkt, smb, hml], axis=1).reindex(idx).to_numpy(dtype=float)
+    cols = {}
+    for col in like.columns:
+        a = ret[col].to_numpy(dtype=float)
+        valid = ~np.isnan(a)
+        out = np.full(len(a), np.nan)
+        if valid.sum() > n:
+            av = a[valid]
+            x = np.column_stack([np.ones(len(av)), m[valid]])
+            for t in range(n - 1, len(av)):
+                xw = x[t - n + 1:t + 1]
+                yw = av[t - n + 1:t + 1]
+                if not np.isfinite(xw).all() or not np.isfinite(yw).all():
+                    continue
+                coef, *_ = np.linalg.lstsq(xw, yw, rcond=None)
+                resid = yw[-1] - xw[-1] @ coef
+                out[np.flatnonzero(valid)[t]] = resid
+        cols[col] = out
+    return pd.DataFrame(cols, index=like.index)
+
+
+def _g191_count(x: pd.DataFrame, n: int) -> pd.DataFrame:
+    """COUNT(X,N)：X 为 0/1（NaN 不成立）时 N 日内成立天数（完整窗口）。"""
+    return _map_cols(x, lambda a: pd.Series(a).rolling(n, min_periods=n)
+                     .sum().to_numpy())
+
+
+def _g191_expanding_range(roll: pd.DataFrame, n: int) -> pd.DataFrame:
+    """alpha165/183：滚动和序列的截至当日扩展 (max−min)。
+
+    DolphinDB 原版对全序列取 rowMax/rowMin（回测中引入未来信息），本移植
+    按无未来函数约定改为扩展极值；暖机段（不足 n 日）保持 NaN。
+    """
+    def fn(a: np.ndarray) -> np.ndarray:
+        out = np.full(len(a), np.nan)
+        valid = np.isfinite(a)
+        if valid.any():
+            filled = np.where(valid, a, -np.inf)
+            cmax = np.maximum.accumulate(filled)
+            cmin = np.minimum.accumulate(np.where(valid, a, np.inf))
+            vals = cmax - cmin
+            vals[~valid] = np.nan
+            out = vals
+        return out
+    return _map_cols(roll, fn)
+
+
+# ---------------------------------------------------------------------------
+# Alpha191：191 个公式（研报公式文本保留在注释中；语义见模块 docstring）
+# ---------------------------------------------------------------------------
+
+def _g191_cmp(x, op: str, y) -> pd.DataFrame:
+    """比较运算：0/1 浮点，任一侧为 NaN（热身/停牌）时结果 NaN。
+
+    op ∈ {"lt","le","gt","ge","eq"}；x/y 均可为标量或宽表。"""
+    if isinstance(x, pd.DataFrame):
+        x_f = x
+        y_f = y if isinstance(y, pd.DataFrame) else _as_frame(float(y), x)
+    elif isinstance(y, pd.DataFrame):
+        x_f = _as_frame(float(x), y)
+        y_f = y
+    else:
+        raise TypeError("_g191_cmp 至少一侧应为宽表 DataFrame")
+    cond = {"lt": x_f < y_f, "le": x_f <= y_f, "gt": x_f > y_f,
+            "ge": x_f >= y_f, "eq": x_f == y_f}[op]
+    return cond.astype(float).mask(x_f.isna() | y_f.isna())
+
+
+def _g001(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * CORR(RANK(DELTA(LOG(VOLUME), 1)), RANK(((CLOSE - OPEN) / OPEN)), 6))
+    return -_corr(ctx.rank(_delta(_log(ctx.v), 1)),
+                  ctx.rank((ctx.c - ctx.o) / ctx.o), 6)
+
+
+def _g002(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * DELTA((((CLOSE - LOW) - (HIGH - CLOSE)) / (HIGH - LOW)), 1))
+    return -_delta(((ctx.c - ctx.l) - (ctx.h - ctx.c)) / (ctx.h - ctx.l), 1)
+
+
+def _g003(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM((CLOSE=DELAY(CLOSE,1)?0:CLOSE-(CLOSE>DELAY(CLOSE,1)?MIN(LOW,DELAY(CLOSE,1)):MAX(HIGH,DELAY(CLOSE,1)))),6)
+    dc = _delay(ctx.c, 1)
+    eq = _g191_cmp(ctx.c, "eq", dc)
+    up = _g191_cmp(ctx.c, "gt", dc)
+    inner = _tern(eq, 0.0, _tern(up, ctx.c - _min2(ctx.l, dc),
+                                 ctx.c - _max2(ctx.h, dc)))
+    return _ts_sum(inner, 6)
+
+
+def _g004(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((((SUM(CLOSE, 8) / 8) + STD(CLOSE, 8)) < (SUM(CLOSE, 2) / 2)) ? (-1 * 1) :
+    #  (((SUM(CLOSE, 2) / 2) < ((SUM(CLOSE, 8) / 8) - STD(CLOSE, 8))) ? 1 :
+    #   (((1 < (VOLUME / MEAN(VOLUME,20))) || ((VOLUME / MEAN(VOLUME,20)) == 1)) ? 1 : (-1 * 1))))
+    s8 = _ts_sum(ctx.c, 8) / 8
+    std8 = _ts_std(ctx.c, 8)
+    s2 = _ts_sum(ctx.c, 2) / 2
+    vr = ctx.v / _ts_mean(ctx.v, 20)
+    cond1 = _g191_cmp(s8 + std8, "lt", s2)
+    cond2 = _g191_cmp(s2, "lt", s8 - std8)
+    cond3 = _g191_cmp(vr, "ge", 1.0)
+    return _tern(cond1, -1.0, _tern(cond2, 1.0, _tern(cond3, 1.0, -1.0)))
+
+
+def _g005(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * TSMAX(CORR(TSRANK(VOLUME, 5), TSRANK(HIGH, 5), 5), 3))
+    return -_ts_max(_corr(_g191_tsrank(ctx.v, 5), _g191_tsrank(ctx.h, 5), 5), 3)
+
+
+def _g006(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(SIGN(DELTA((((OPEN * 0.85) + (HIGH * 0.15))), 4)))* -1)
+    return -ctx.rank(_sign(_delta(ctx.o * 0.85 + ctx.h * 0.15, 4)))
+
+
+def _g007(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((RANK(MAX((VWAP - CLOSE), 3)) + RANK(MIN((VWAP - CLOSE), 3))) * RANK(DELTA(VOLUME, 3)))
+    # 注：按公式外层括号为 (A+B)×C；DolphinDB 原版丢括号变成 A+B×C。
+    d = ctx.vwap - ctx.c
+    return (ctx.rank(_ts_max(d, 3)) + ctx.rank(_ts_min(d, 3))) \
+        * ctx.rank(_delta(ctx.v, 3))
+
+
+def _g008(ctx: _G191Ctx) -> pd.DataFrame:
+    # RANK(DELTA(((((HIGH + LOW) / 2) * 0.2) + (VWAP * 0.8)), 4) * -1)
+    return ctx.rank(-_delta((ctx.h + ctx.l) / 2 * 0.2 + ctx.vwap * 0.8, 4))
+
+
+def _g009(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(((HIGH+LOW)/2-(DELAY(HIGH,1)+DELAY(LOW,1))/2)*(HIGH-LOW)/VOLUME,7,2)
+    a = ((ctx.h + ctx.l) / 2 - (_delay(ctx.h, 1) + _delay(ctx.l, 1)) / 2) \
+        * (ctx.h - ctx.l) / ctx.v
+    return _g191_sma(a, 7, 2)
+
+
+def _g010(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(MAX(((RET < 0) ? STD(RET, 20) : CLOSE)^2),5))
+    inner = _tern(_g191_cmp(ctx.ret, "lt", 0.0), _ts_std(ctx.ret, 20),
+                  ctx.c) ** 2
+    return ctx.rank(_ts_max(inner, 5))
+
+
+def _g011(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM(((CLOSE-LOW)-(HIGH-CLOSE))./(HIGH-LOW).*VOLUME,6)
+    return _ts_sum(((ctx.c - ctx.l) - (ctx.h - ctx.c)) / (ctx.h - ctx.l)
+                   * ctx.v, 6)
+
+
+def _g012(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK((OPEN - (SUM(VWAP, 10) / 10)))) * (-1 * (RANK(ABS((CLOSE - VWAP)))))
+    return ctx.rank(ctx.o - _ts_sum(ctx.vwap, 10) / 10) \
+        * -ctx.rank(_abs(ctx.c - ctx.vwap))
+
+
+def _g013(ctx: _G191Ctx) -> pd.DataFrame:
+    # (((HIGH * LOW)^0.5) - VWAP)
+    return np.sqrt(ctx.h * ctx.l) - ctx.vwap
+
+
+def _g014(ctx: _G191Ctx) -> pd.DataFrame:
+    # CLOSE-DELAY(CLOSE,5)
+    return ctx.c - _delay(ctx.c, 5)
+
+
+def _g015(ctx: _G191Ctx) -> pd.DataFrame:
+    # OPEN/DELAY(CLOSE,1)-1
+    return ctx.o / _delay(ctx.c, 1) - 1
+
+
+def _g016(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * TSMAX(RANK(CORR(RANK(VOLUME), RANK(VWAP), 5)), 5))
+    return -_ts_max(ctx.rank(_corr(ctx.rank(ctx.v), ctx.rank(ctx.vwap), 5)), 5)
+
+
+def _g017(ctx: _G191Ctx) -> pd.DataFrame:
+    # RANK((VWAP - MAX(VWAP, 15)))^DELTA(CLOSE, 5)
+    return ctx.rank(ctx.vwap - _ts_max(ctx.vwap, 15)).pow(_delta(ctx.c, 5))
+
+
+def _g018(ctx: _G191Ctx) -> pd.DataFrame:
+    # CLOSE/DELAY(CLOSE,5)
+    return ctx.c / _delay(ctx.c, 5)
+
+
+def _g019(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE<DELAY(CLOSE,5)?(CLOSE-DELAY(CLOSE,5))/DELAY(CLOSE,5):
+    #  (CLOSE=DELAY(CLOSE,5)?0:(CLOSE-DELAY(CLOSE,5))/CLOSE))
+    dc5 = _delay(ctx.c, 5)
+    return _tern(_g191_cmp(ctx.c, "lt", dc5), (ctx.c - dc5) / dc5,
+                 _tern(_g191_cmp(ctx.c, "eq", dc5), 0.0, (ctx.c - dc5) / ctx.c))
+
+
+def _g020(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE-DELAY(CLOSE,6))/DELAY(CLOSE,6)*100
+    dc6 = _delay(ctx.c, 6)
+    return (ctx.c - dc6) / dc6 * 100
+
+
+def _g021(ctx: _G191Ctx) -> pd.DataFrame:
+    # REGBETA(MEAN(CLOSE,6),SEQUENCE(6))（回归窗口按 SEQUENCE 长度补 6）
+    return _g191_trend_slope(_ts_mean(ctx.c, 6), 6)
+
+
+def _g022(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMEAN(((CLOSE-MEAN(CLOSE,6))/MEAN(CLOSE,6)-DELAY((CLOSE-MEAN(CLOSE,6))/MEAN(CLOSE,6),3)),12,1)
+    # SMEAN 为未定义名称，按 SMA(n=12,m=1) 修正（研报别名候选）。
+    a = (ctx.c - _ts_mean(ctx.c, 6)) / _ts_mean(ctx.c, 6)
+    return _g191_sma(a - _delay(a, 3), 12, 1)
+
+
+def _g023(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA((CLOSE>DELAY(CLOSE,1)?STD(CLOSE,20):0),20,1)/
+    #  (SMA(...,20,1)+SMA((CLOSE<=DELAY(CLOSE,1)?STD(CLOSE,20):0),20,1))*100
+    dc = _delay(ctx.c, 1)
+    std20 = _ts_std(ctx.c, 20)
+    a = _tern(_g191_cmp(ctx.c, "gt", dc), std20, 0.0)
+    b = _tern(_g191_cmp(ctx.c, "le", dc), std20, 0.0)
+    ea = _g191_sma(a, 20, 1)
+    eb = _g191_sma(b, 20, 1)
+    return ea / (ea + eb) * 100
+
+
+def _g024(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(CLOSE-DELAY(CLOSE,5),5,1)
+    return _g191_sma(ctx.c - _delay(ctx.c, 5), 5, 1)
+
+
+def _g025(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((-1 * RANK((DELTA(CLOSE, 7) * (1 - RANK(DECAYLINEAR((VOLUME / MEAN(VOLUME,20)), 9)))))) * (1 + RANK(SUM(RET, 250))))
+    part = _delta(ctx.c, 7) \
+        * (1 - ctx.rank(_decay_linear(ctx.v / _ts_mean(ctx.v, 20), 9)))
+    return -ctx.rank(part) * (1 + ctx.rank(_ts_sum(ctx.ret, 250)))
+
+
+def _g026(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((((SUM(CLOSE, 7) / 7) - CLOSE)) + ((CORR(VWAP, DELAY(CLOSE, 5), 230))))
+    return _ts_sum(ctx.c, 7) / 7 - ctx.c \
+        + _corr(ctx.vwap, _delay(ctx.c, 5), 230)
+
+
+def _g027(ctx: _G191Ctx) -> pd.DataFrame:
+    # WMA((CLOSE-DELAY(CLOSE,3))/DELAY(CLOSE,3)*100+(CLOSE-DELAY(CLOSE,6))/DELAY(CLOSE,6)*100,12)
+    a = (ctx.c - _delay(ctx.c, 3)) / _delay(ctx.c, 3) * 100 \
+        + (ctx.c - _delay(ctx.c, 6)) / _delay(ctx.c, 6) * 100
+    return _g191_wma(a, 12)
+
+
+def _g028(ctx: _G191Ctx) -> pd.DataFrame:
+    # 3*SMA((CLOSE-TSMIN(LOW,9))/(TSMAX(HIGH,9)-TSMIN(LOW,9))*100,3,1)
+    #  -2*SMA(SMA((CLOSE-TSMIN(LOW,9))/(MAX(HIGH,9)-TSMAX(LOW,9))*100,3,1),3,1)
+    # 注：第二项分母按笔误修正为与第一项相同（3×Alpha57−2×Alpha96 结构）。
+    rs9 = (ctx.c - _ts_min(ctx.l, 9)) / (_ts_max(ctx.h, 9) - _ts_min(ctx.l, 9)) * 100
+    sma1 = _g191_sma(rs9, 3, 1)
+    return 3 * sma1 - 2 * _g191_sma(sma1, 3, 1)
+
+
+def _g029(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE-DELAY(CLOSE,6))/DELAY(CLOSE,6)*VOLUME
+    dc6 = _delay(ctx.c, 6)
+    return (ctx.c - dc6) / dc6 * ctx.v
+
+
+def _g030(ctx: _G191Ctx) -> pd.DataFrame:
+    # WMA((REGRESI(CLOSE/DELAY(CLOSE)-1,MKT,SMB,HML，60))^2,20)
+    if ctx._mkt is None or ctx._smb is None or ctx._hml is None:
+        ctx.warn_missing("gtja030", "Fama-French 三因子 (mkt/smb/hml)")
+        return _nan_like(ctx.c)
+    resid = _g191_regresi_ff3(ctx.ret, ctx._mkt, ctx._smb, ctx._hml,
+                              ctx.c, 60)
+    return _g191_wma(resid ** 2, 20)
+
+
+def _g031(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE-MEAN(CLOSE,12))/MEAN(CLOSE,12)*100
+    m12 = _ts_mean(ctx.c, 12)
+    return (ctx.c - m12) / m12 * 100
+
+
+def _g032(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * SUM(RANK(CORR(RANK(HIGH), RANK(VOLUME), 3)), 3))
+    return -_ts_sum(ctx.rank(_corr(ctx.rank(ctx.h), ctx.rank(ctx.v), 3)), 3)
+
+
+def _g033(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((((-1 * TSMIN(LOW, 5)) + DELAY(TSMIN(LOW, 5), 5)) * RANK(((SUM(RET, 240) - SUM(RET, 20)) / 220))) * TSRANK(VOLUME, 5))
+    # 注：按公式括号为 ((Σ240−Σ20)/220)；DolphinDB 原版丢括号。
+    part = (-_ts_min(ctx.l, 5) + _delay(_ts_min(ctx.l, 5), 5)) \
+        * ctx.rank((_ts_sum(ctx.ret, 240) - _ts_sum(ctx.ret, 20)) / 220) \
+        * _g191_tsrank(ctx.v, 5)
+    return part
+
+
+def _g034(ctx: _G191Ctx) -> pd.DataFrame:
+    # MEAN(CLOSE,12)/CLOSE
+    return _ts_mean(ctx.c, 12) / ctx.c
+
+
+def _g035(ctx: _G191Ctx) -> pd.DataFrame:
+    # (MIN(RANK(DECAYLINEAR(DELTA(OPEN, 1), 15)), RANK(DECAYLINEAR(CORR((VOLUME), ((OPEN * 0.65) + (OPEN *0.35)), 17),7))) * -1)
+    a = ctx.rank(_decay_linear(_delta(ctx.o, 1), 15))
+    b = ctx.rank(_decay_linear(
+        _corr(ctx.v, ctx.o * 0.65 + ctx.o * 0.35, 17), 7))
+    return -_min2(a, b)
+
+
+def _g036(ctx: _G191Ctx) -> pd.DataFrame:
+    # RANK(SUM(CORR(RANK(VOLUME), RANK(VWAP), 6), 2))
+    return ctx.rank(_ts_sum(_corr(ctx.rank(ctx.v), ctx.rank(ctx.vwap), 6), 2))
+
+
+def _g037(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * RANK(((SUM(OPEN, 5) * SUM(RET, 5)) - DELAY((SUM(OPEN, 5) * SUM(RET, 5)), 10))))
+    inner = _ts_sum(ctx.o, 5) * _ts_sum(ctx.ret, 5)
+    return -ctx.rank(inner - _delay(inner, 10))
+
+
+def _g038(ctx: _G191Ctx) -> pd.DataFrame:
+    # (((SUM(HIGH, 20) / 20) < HIGH) ? (-1 * DELTA(HIGH, 2)) : 0)
+    cond = _g191_cmp(_ts_sum(ctx.h, 20) / 20, "lt", ctx.h)
+    return _tern(cond, -_delta(ctx.h, 2), 0.0)
+
+
+def _g039(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((RANK(DECAYLINEAR(DELTA((CLOSE), 2),8)) - RANK(DECAYLINEAR(CORR(((VWAP * 0.3) + (OPEN * 0.7)), SUM(MEAN(VOLUME,180), 37), 14), 12))) * -1)
+    a = ctx.rank(_decay_linear(_delta(ctx.c, 2), 8))
+    b = ctx.rank(_decay_linear(
+        _corr(ctx.vwap * 0.3 + ctx.o * 0.7,
+              _ts_sum(_ts_mean(ctx.v, 180), 37), 14), 12))
+    return -(a - b)
+
+
+def _g040(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM((CLOSE>DELAY(CLOSE,1)?VOLUME:0),26)/SUM((CLOSE<=DELAY(CLOSE,1)?VOLUME:0),26)*100
+    dc = _delay(ctx.c, 1)
+    up = _tern(_g191_cmp(ctx.c, "gt", dc), ctx.v, 0.0)
+    dn = _tern(_g191_cmp(ctx.c, "le", dc), ctx.v, 0.0)
+    return _ts_sum(up, 26) / _ts_sum(dn, 26) * 100
+
+
+def _g041(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(MAX(DELTA((VWAP), 3), 5))* -1)
+    return -ctx.rank(_ts_max(_delta(ctx.vwap, 3), 5))
+
+
+def _g042(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((-1 * RANK(STD(HIGH, 10))) * CORR(HIGH, VOLUME, 10))
+    return -ctx.rank(_ts_std(ctx.h, 10)) * _corr(ctx.h, ctx.v, 10)
+
+
+def _g043(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM((CLOSE>DELAY(CLOSE,1)?VOLUME:(CLOSE<DELAY(CLOSE,1)?-VOLUME:0)),6)
+    dc = _delay(ctx.c, 1)
+    inner = _tern(_g191_cmp(ctx.c, "gt", dc), ctx.v,
+                  _tern(_g191_cmp(ctx.c, "lt", dc), -ctx.v, 0.0))
+    return _ts_sum(inner, 6)
+
+
+def _g044(ctx: _G191Ctx) -> pd.DataFrame:
+    # (TSRANK(DECAYLINEAR(CORR(((LOW )), MEAN(VOLUME,10), 7), 6),4) + TSRANK(DECAYLINEAR(DELTA((VWAP), 3), 10), 15))
+    a = _g191_tsrank(
+        _decay_linear(_corr(ctx.l, _ts_mean(ctx.v, 10), 7), 6), 4)
+    b = _g191_tsrank(_decay_linear(_delta(ctx.vwap, 3), 10), 15)
+    return a + b
+
+
+def _g045(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(DELTA((((CLOSE * 0.6) + (OPEN *0.4))), 1)) * RANK(CORR(VWAP, MEAN(VOLUME,150), 15)))
+    a = ctx.rank(_delta(ctx.c * 0.6 + ctx.o * 0.4, 1))
+    b = ctx.rank(_corr(ctx.vwap, _ts_mean(ctx.v, 150), 15))
+    return a * b
+
+
+def _g046(ctx: _G191Ctx) -> pd.DataFrame:
+    # (MEAN(CLOSE,3)+MEAN(CLOSE,6)+MEAN(CLOSE,12)+MEAN(CLOSE,24))/(4*CLOSE)
+    return (_ts_mean(ctx.c, 3) + _ts_mean(ctx.c, 6) + _ts_mean(ctx.c, 12)
+            + _ts_mean(ctx.c, 24)) / (4 * ctx.c)
+
+
+def _g047(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA((TSMAX(HIGH,6)-CLOSE)/(TSMAX(HIGH,6)-TSMIN(LOW,6))*100,9,1)
+    a = (_ts_max(ctx.h, 6) - ctx.c) \
+        / (_ts_max(ctx.h, 6) - _ts_min(ctx.l, 6)) * 100
+    return _g191_sma(a, 9, 1)
+
+
+def _g048(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1*((RANK(((SIGN((CLOSE - DELAY(CLOSE, 1))) + SIGN((DELAY(CLOSE, 1) - DELAY(CLOSE, 2)))) + SIGN((DELAY(CLOSE, 2) - DELAY(CLOSE, 3)))))) * SUM(VOLUME, 5)) / SUM(VOLUME, 20))
+    dc = _delay(ctx.c, 1)
+    sgn = _sign(ctx.c - dc) + _sign(dc - _delay(ctx.c, 2)) \
+        + _sign(_delay(ctx.c, 2) - _delay(ctx.c, 3))
+    return -ctx.rank(sgn) * _ts_sum(ctx.v, 5) / _ts_sum(ctx.v, 20)
+
+
+def _g191_hl_band(ctx: _G191Ctx) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """alpha49/50/51 共用：高低点带内涨跌日的 12 日求和（sum1=跌, sum2=涨）。"""
+    hlag = _delay(ctx.h, 1)
+    llag = _delay(ctx.l, 1)
+    move = _max2(_abs(ctx.h - hlag), _abs(ctx.l - llag))
+    sum1 = _ts_sum(_tern(_g191_cmp(ctx.h + ctx.l, "ge", hlag + llag), 0.0,
+                         move), 12)
+    sum2 = _ts_sum(_tern(_g191_cmp(ctx.h + ctx.l, "le", hlag + llag), 0.0,
+                         move), 12)
+    return sum1, sum2
+
+
+def _g049(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM(((HIGH+LOW)>=(DELAY(HIGH,1)+DELAY(LOW,1))?0:MAX(ABS(HIGH-DELAY(HIGH,1)),ABS(LOW-DELAY(LOW,1)))),12)/
+    #  (同分子 + SUM(((HIGH+LOW)<=(DELAY(HIGH,1)+DELAY(LOW,1))?0:MAX(...)),12))
+    sum1, sum2 = _g191_hl_band(ctx)
+    return sum1 / (sum1 + sum2)
+
+
+def _g050(ctx: _G191Ctx) -> pd.DataFrame:
+    # 与 alpha49 同结构：sum1/(sum1+sum2) - sum2/(sum1+sum2)
+    sum1, sum2 = _g191_hl_band(ctx)
+    return sum1 / (sum1 + sum2) - sum2 / (sum1 + sum2)
+
+
+def _g051(ctx: _G191Ctx) -> pd.DataFrame:
+    # 与 alpha49 同结构：sum1/(sum1+sum2)
+    sum1, sum2 = _g191_hl_band(ctx)
+    return sum1 / (sum1 + sum2)
+
+
+def _g052(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM(MAX(0,HIGH-DELAY((HIGH+LOW+CLOSE)/3,1)),26)/SUM(MAX(0,DELAY((HIGH+LOW+CLOSE)/3,1)-L),26)* 100
+    tp = (ctx.h + ctx.l + ctx.c) / 3
+    dtp = _delay(tp, 1)
+    num = _ts_sum(np.maximum(0.0, ctx.h - dtp), 26)
+    den = _ts_sum(np.maximum(0.0, dtp - ctx.l), 26)
+    return num / den * 100
+
+
+def _g053(ctx: _G191Ctx) -> pd.DataFrame:
+    # COUNT(CLOSE>DELAY(CLOSE,1),12)/12*100
+    return _g191_count(_g191_cmp(ctx.c, "gt", _delay(ctx.c, 1)), 12) / 12 * 100
+
+
+def _g054(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * RANK((STD(ABS(CLOSE - OPEN)) + (CLOSE - OPEN)) + CORR(CLOSE, OPEN,10)))
+    # STD 窗口研报未给，按 DolphinDB 基准取 10。
+    inner = _ts_std(_abs(ctx.c - ctx.o), 10) + (ctx.c - ctx.o) \
+        + _corr(ctx.c, ctx.o, 10)
+    return -ctx.rank(inner)
+
+
+def _g055(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM(16*(CLOSE-DELAY(CLOSE,1)+(CLOSE-OPEN)/2+DELAY(CLOSE,1)-DELAY(OPEN,1))/
+    #  ((ABS(HIGH-DELAY(CLOSE,1))>ABS(LOW-DELAY(CLOSE,1)) & ABS(HIGH-DELAY(CLOSE,1))>ABS(HIGH-DELAY(LOW,1))?
+    #     ABS(HIGH-DELAY(CLOSE,1))+ABS(LOW-DELAY(CLOSE,1))/2+ABS(DELAY(CLOSE,1)-DELAY(OPEN,1))/4:
+    #    (ABS(LOW-DELAY(CLOSE,1))>ABS(HIGH-DELAY(LOW,1)) & ABS(LOW-DELAY(CLOSE,1))>ABS(HIGH-DELAY(CLOSE,1))?
+    #      ABS(LOW-DELAY(CLOSE,1))+ABS(HIGH-DELAY(CLOSE,1))/2+ABS(DELAY(CLOSE,1)-DELAY(OPEN,1))/4:
+    #      ABS(HIGH-DELAY(LOW,1))+ABS(DELAY(CLOSE,1)-DELAY(OPEN,1))/4)))
+    #  *MAX(ABS(HIGH-DELAY(CLOSE,1)),ABS(LOW-DELAY(CLOSE,1))),20)
+    dc1 = _delay(ctx.c, 1)
+    do1 = _delay(ctx.o, 1)
+    dl1 = _delay(ctx.l, 1)
+    a = _abs(ctx.h - dc1)
+    b = _abs(ctx.l - dc1)
+    cc = _abs(ctx.h - dl1)
+    tmp1 = 16 * (ctx.c - dc1 + (ctx.c - ctx.o) / 2 + dc1 - do1)
+    cond1 = (_g191_cmp(a, "gt", b) * _g191_cmp(a, "gt", cc))
+    v1 = a + b / 2 + _abs(dc1 - do1) / 4
+    cond2 = _g191_cmp(b, "gt", cc) * _g191_cmp(b, "gt", a)
+    v2 = b + a / 2 + _abs(dc1 - do1) / 4
+    v3 = cc + _abs(dc1 - do1) / 4
+    tmp2 = np.where(cond1.fillna(0.0).astype(bool), v1,
+                    np.where(cond2.fillna(0.0).astype(bool), v2, v3))
+    tmp3 = _max2(a, b)
+    return _ts_sum(tmp1 / tmp2 * tmp3, 20)
+
+
+def _g056(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK((OPEN - TSMIN(OPEN, 12))) < RANK((RANK(CORR(SUM(((HIGH + LOW) / 2), 19), SUM(MEAN(VOLUME,40), 19), 13))^5)))
+    a = ctx.rank(ctx.o - _ts_min(ctx.o, 12))
+    inner = ctx.rank(_corr(_ts_sum((ctx.h + ctx.l) / 2, 19),
+                           _ts_sum(_ts_mean(ctx.v, 40), 19), 13)) ** 5
+    return _g191_cmp(a, "lt", ctx.rank(inner))
+
+
+def _g057(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA((CLOSE-TSMIN(LOW,9))/(TSMAX(HIGH,9)-TSMIN(LOW,9))*100,3,1)
+    a = (ctx.c - _ts_min(ctx.l, 9)) / (_ts_max(ctx.h, 9) - _ts_min(ctx.l, 9)) * 100
+    return _g191_sma(a, 3, 1)
+
+
+def _g058(ctx: _G191Ctx) -> pd.DataFrame:
+    # COUNT(CLOSE>DELAY(CLOSE,1),20)/20*100
+    return _g191_count(_g191_cmp(ctx.c, "gt", _delay(ctx.c, 1)), 20) / 20 * 100
+
+
+def _g059(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM((CLOSE=DELAY(CLOSE,1)?0:CLOSE-(CLOSE>DELAY(CLOSE,1)?MIN(LOW,DELAY(CLOSE,1)):MAX(HIGH,DELAY(CLOSE,1)))),20)
+    dc = _delay(ctx.c, 1)
+    eq = _g191_cmp(ctx.c, "eq", dc)
+    up = _g191_cmp(ctx.c, "gt", dc)
+    inner = _tern(eq, 0.0, _tern(up, ctx.c - _min2(ctx.l, dc),
+                                 ctx.c - _max2(ctx.h, dc)))
+    return _ts_sum(inner, 20)
+
+
+def _g060(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM(((CLOSE-LOW)-(HIGH-CLOSE))./(HIGH-LOW).*VOLUME,20)
+    return _ts_sum(((ctx.c - ctx.l) - (ctx.h - ctx.c)) / (ctx.h - ctx.l)
+                   * ctx.v, 20)
+
+
+def _g061(ctx: _G191Ctx) -> pd.DataFrame:
+    # (MAX(RANK(DECAYLINEAR(DELTA(VWAP, 1), 12)), RANK(DECAYLINEAR(RANK(CORR((LOW),MEAN(VOLUME,80), 8)), 17))) * -1)
+    a = ctx.rank(_decay_linear(_delta(ctx.vwap, 1), 12))
+    b = ctx.rank(_decay_linear(
+        ctx.rank(_corr(ctx.l, _ts_mean(ctx.v, 80), 8)), 17))
+    return -_max2(a, b)
+
+
+def _g062(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * CORR(HIGH, RANK(VOLUME), 5))
+    return -_corr(ctx.h, ctx.rank(ctx.v), 5)
+
+
+def _g063(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(MAX(CLOSE-DELAY(CLOSE,1),0),6,1)/SMA(ABS(CLOSE-DELAY(CLOSE,1)),6,1)*100
+    d = ctx.c - _delay(ctx.c, 1)
+    return _g191_sma(np.maximum(d, 0.0), 6, 1) \
+        / _g191_sma(_abs(d), 6, 1) * 100
+
+
+def _g064(ctx: _G191Ctx) -> pd.DataFrame:
+    # (MAX(RANK(DECAYLINEAR(CORR(RANK(VWAP), RANK(VOLUME), 4), 4)), RANK(DECAYLINEAR(MAX(CORR(RANK(CLOSE), RANK(MEAN(VOLUME,60)), 4), 13), 14))) * -1)
+    a = ctx.rank(_decay_linear(
+        _corr(ctx.rank(ctx.vwap), ctx.rank(ctx.v), 4), 4))
+    b = ctx.rank(_decay_linear(
+        _ts_max(_corr(ctx.rank(ctx.c), ctx.rank(_ts_mean(ctx.v, 60)), 4), 13),
+        14))
+    return -_max2(a, b)
+
+
+def _g065(ctx: _G191Ctx) -> pd.DataFrame:
+    # MEAN(CLOSE,6)/CLOSE
+    return _ts_mean(ctx.c, 6) / ctx.c
+
+
+def _g066(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE-MEAN(CLOSE,6))/MEAN(CLOSE,6)*100
+    m6 = _ts_mean(ctx.c, 6)
+    return (ctx.c - m6) / m6 * 100
+
+
+def _g067(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(MAX(CLOSE-DELAY(CLOSE,1),0),24,1)/SMA(ABS(CLOSE-DELAY(CLOSE,1)),24,1)*100
+    d = ctx.c - _delay(ctx.c, 1)
+    return _g191_sma(np.maximum(d, 0.0), 24, 1) \
+        / _g191_sma(_abs(d), 24, 1) * 100
+
+
+def _g068(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(((HIGH+LOW)/2-(DELAY(HIGH,1)+DELAY(LOW,1))/2)*(HIGH-LOW)/VOLUME,15,2)
+    a = ((ctx.h + ctx.l) / 2 - (_delay(ctx.h, 1) + _delay(ctx.l, 1)) / 2) \
+        * (ctx.h - ctx.l) / ctx.v
+    return _g191_sma(a, 15, 2)
+
+
+def _g069(ctx: _G191Ctx) -> pd.DataFrame:
+    # (SUM(DTM,20)>SUM(DBM,20) ? (SUM(DTM,20)-SUM(DBM,20))/SUM(DTM,20) :
+    #  (SUM(DTM,20)=SUM(DBM,20) ? 0:(SUM(DTM,20)-SUM(DBM,20))/SUM(DBM,20)))
+    # DTM: (OPEN<=DELAY(OPEN,1)?0:MAX((HIGH-OPEN),(OPEN-DELAY(OPEN,1))))
+    # DBM: (OPEN>=DELAY(OPEN,1)?0:MAX((OPEN-LOW),(OPEN-DELAY(OPEN,1))))（按原文方向）
+    do1 = _delay(ctx.o, 1)
+    dtm = _tern(_g191_cmp(ctx.o, "le", do1), 0.0,
+                _max2(ctx.h - ctx.o, ctx.o - do1))
+    dbm = _tern(_g191_cmp(ctx.o, "ge", do1), 0.0,
+                _max2(ctx.o - ctx.l, ctx.o - do1))
+    sdtm = _ts_sum(dtm, 20)
+    sdbm = _ts_sum(dbm, 20)
+    return _tern(_g191_cmp(sdtm, "gt", sdbm), (sdtm - sdbm) / sdtm,
+                 _tern(_g191_cmp(sdtm, "eq", sdbm), 0.0,
+                       (sdtm - sdbm) / sdbm))
+
+
+def _g070(ctx: _G191Ctx) -> pd.DataFrame:
+    # STD(AMOUNT,6)
+    return _ts_std(ctx.amount(), 6)
+
+
+def _g071(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE-MEAN(CLOSE,24))/MEAN(CLOSE,24)*100
+    m24 = _ts_mean(ctx.c, 24)
+    return (ctx.c - m24) / m24 * 100
+
+
+def _g072(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA((TSMAX(HIGH,6)-CLOSE)/(TSMAX(HIGH,6)-TSMIN(LOW,6))*100,15,1)
+    a = (_ts_max(ctx.h, 6) - ctx.c) \
+        / (_ts_max(ctx.h, 6) - _ts_min(ctx.l, 6)) * 100
+    return _g191_sma(a, 15, 1)
+
+
+def _g073(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((TSRANK(DECAYLINEAR(DECAYLINEAR(CORR((CLOSE), VOLUME, 10), 16), 4), 5) - RANK(DECAYLINEAR(CORR(VWAP, MEAN(VOLUME,30), 4),3))) * -1)
+    a = _g191_tsrank(
+        _decay_linear(_decay_linear(_corr(ctx.c, ctx.v, 10), 16), 4), 5)
+    b = ctx.rank(_decay_linear(_corr(ctx.vwap, _ts_mean(ctx.v, 30), 4), 3))
+    return -(a - b)
+
+
+def _g074(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(CORR(SUM(((LOW * 0.35) + (VWAP * 0.65)), 20), SUM(MEAN(VOLUME,40), 20), 7)) + RANK(CORR(RANK(VWAP), RANK(VOLUME), 6)))
+    a = ctx.rank(_corr(_ts_sum(ctx.l * 0.35 + ctx.vwap * 0.65, 20),
+                       _ts_sum(_ts_mean(ctx.v, 40), 20), 7))
+    b = ctx.rank(_corr(ctx.rank(ctx.vwap), ctx.rank(ctx.v), 6))
+    return a + b
+
+
+def _g075(ctx: _G191Ctx) -> pd.DataFrame:
+    # COUNT(CLOSE>OPEN & BANCHMARKINDEXCLOSE<BANCHMARKINDEXOPEN,50)/
+    #  COUNT(BANCHMARKINDEXCLOSE<BANCHMARKINDEXOPEN,50)
+    iopen = ctx.idx_open("gtja075")
+    iclose = ctx.idx_close("gtja075")
+    joint = _g191_cmp(ctx.c, "gt", ctx.o) \
+        * _g191_cmp(iclose, "lt", iopen)
+    base = _g191_cmp(iclose, "lt", iopen)
+    return _g191_count(joint, 50) / _g191_count(base, 50)
+
+
+def _g076(ctx: _G191Ctx) -> pd.DataFrame:
+    # STD(ABS((CLOSE/DELAY(CLOSE,1)-1))/VOLUME,20)/MEAN(ABS((CLOSE/DELAY(CLOSE,1)-1))/VOLUME,20)
+    a = _abs(ctx.c / _delay(ctx.c, 1) - 1) / ctx.v
+    return _ts_std(a, 20) / _ts_mean(a, 20)
+
+
+def _g077(ctx: _G191Ctx) -> pd.DataFrame:
+    # MIN(RANK(DECAYLINEAR(((((HIGH + LOW) / 2) + HIGH) - (VWAP + HIGH)), 20)), RANK(DECAYLINEAR(CORR(((HIGH + LOW) / 2), MEAN(VOLUME,40), 3), 6)))
+    a = ctx.rank(_decay_linear(
+        (ctx.h + ctx.l) / 2 + ctx.h - (ctx.vwap + ctx.h), 20))
+    b = ctx.rank(_decay_linear(
+        _corr((ctx.h + ctx.l) / 2, _ts_mean(ctx.v, 40), 3), 6))
+    return _min2(a, b)
+
+
+def _g078(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((HIGH+LOW+CLOSE)/3-MA((HIGH+LOW+CLOSE)/3,12))/(0.015*MEAN(ABS(CLOSE-MEAN((HIGH+LOW+CLOSE)/3,12)),12))
+    tp = (ctx.h + ctx.l + ctx.c) / 3
+    m12 = _ts_mean(tp, 12)
+    return (tp - m12) / (0.015 * _ts_mean(_abs(ctx.c - m12), 12))
+
+
+def _g079(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(MAX(CLOSE-DELAY(CLOSE,1),0),12,1)/SMA(ABS(CLOSE-DELAY(CLOSE,1)),12,1)*100
+    d = ctx.c - _delay(ctx.c, 1)
+    return _g191_sma(np.maximum(d, 0.0), 12, 1) \
+        / _g191_sma(_abs(d), 12, 1) * 100
+
+
+def _g080(ctx: _G191Ctx) -> pd.DataFrame:
+    # (VOLUME-DELAY(VOLUME,5))/DELAY(VOLUME,5)*100
+    dv = _delay(ctx.v, 5)
+    return (ctx.v - dv) / dv * 100
+
+
+def _g081(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(VOLUME,21,2)（DolphinDB 原版误用 α=1/21，按公式取 2/21）
+    return _g191_sma(ctx.v, 21, 2)
+
+
+def _g082(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA((TSMAX(HIGH,6)-CLOSE)/(TSMAX(HIGH,6)-TSMIN(LOW,6))*100,20,1)
+    a = (_ts_max(ctx.h, 6) - ctx.c) \
+        / (_ts_max(ctx.h, 6) - _ts_min(ctx.l, 6)) * 100
+    return _g191_sma(a, 20, 1)
+
+
+def _g083(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * RANK(COVIANCE(RANK(HIGH), RANK(VOLUME), 5)))
+    return -ctx.rank(_cov(ctx.rank(ctx.h), ctx.rank(ctx.v), 5))
+
+
+def _g084(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM((CLOSE>DELAY(CLOSE,1)?VOLUME:(CLOSE<DELAY(CLOSE,1)?-VOLUME:0)),20)
+    dc = _delay(ctx.c, 1)
+    inner = _tern(_g191_cmp(ctx.c, "gt", dc), ctx.v,
+                  _tern(_g191_cmp(ctx.c, "lt", dc), -ctx.v, 0.0))
+    return _ts_sum(inner, 20)
+
+
+def _g085(ctx: _G191Ctx) -> pd.DataFrame:
+    # (TSRANK((VOLUME / MEAN(VOLUME,20)), 20) * TSRANK((-1 * DELTA(CLOSE, 7)), 8))
+    return _g191_tsrank(ctx.v / _ts_mean(ctx.v, 20), 20) \
+        * _g191_tsrank(-_delta(ctx.c, 7), 8)
+
+
+def _g086(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((0.25 < (((DELAY(CLOSE, 20) - DELAY(CLOSE, 10)) / 10) - ((DELAY(CLOSE, 10) - CLOSE) / 10))) ? (-1 * 1) :
+    #  (((((DELAY(CLOSE, 20) - DELAY(CLOSE, 10)) / 10) - ((DELAY(CLOSE, 10) - CLOSE) / 10)) < 0) ? 1 : ((-1 * 1) * (CLOSE - DELAY(CLOSE, 1)))))
+    x = (_delay(ctx.c, 20) - _delay(ctx.c, 10)) / 10 \
+        - (_delay(ctx.c, 10) - ctx.c) / 10
+    return _tern(_g191_cmp(0.0, "lt", x), -1.0,
+                 _tern(_g191_cmp(x, "lt", 0.0), 1.0,
+                       -1.0 * (ctx.c - _delay(ctx.c, 1))))
+
+
+def _g087(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((RANK(DECAYLINEAR(DELTA(VWAP, 4), 7)) + TSRANK(DECAYLINEAR(((((LOW * 0.9) + (LOW * 0.1)) - VWAP) / (OPEN - ((HIGH + LOW) / 2))), 11), 7)) * -1)
+    a = ctx.rank(_decay_linear(_delta(ctx.vwap, 4), 7))
+    b = _g191_tsrank(_decay_linear(
+        (ctx.l * 0.9 + ctx.l * 0.1 - ctx.vwap)
+        / (ctx.o - (ctx.h + ctx.l) / 2), 11), 7)
+    return -(a + b)
+
+
+def _g088(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE-DELAY(CLOSE,20))/DELAY(CLOSE,20)*100
+    dc20 = _delay(ctx.c, 20)
+    return (ctx.c - dc20) / dc20 * 100
+
+
+def _g089(ctx: _G191Ctx) -> pd.DataFrame:
+    # 2*(SMA(CLOSE,13,2)-SMA(CLOSE,27,2)-SMA(SMA(CLOSE,13,2)-SMA(CLOSE,27,2),10,2))
+    a = _g191_sma(ctx.c, 13, 2)
+    b = _g191_sma(a, 27, 2)
+    return 2 * (a - b - _g191_sma(a - b, 10, 2))
+
+
+def _g090(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(CORR(RANK(VWAP), RANK(VOLUME), 5)) * -1)
+    return -ctx.rank(_corr(ctx.rank(ctx.vwap), ctx.rank(ctx.v), 5))
+
+
+def _g091(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((RANK((CLOSE - MAX(CLOSE, 5)))*RANK(CORR((MEAN(VOLUME,40)), LOW, 5))) * -1)
+    return -ctx.rank(ctx.c - _ts_max(ctx.c, 5)) \
+        * ctx.rank(_corr(_ts_mean(ctx.v, 40), ctx.l, 5))
+
+
+def _g092(ctx: _G191Ctx) -> pd.DataFrame:
+    # (MAX(RANK(DECAYLINEAR(DELTA(((CLOSE * 0.35) + (VWAP *0.65)), 2), 3)), TSRANK(DECAYLINEAR(ABS(CORR((MEAN(VOLUME,180)), CLOSE, 13)), 5), 15)) * -1)
+    a = ctx.rank(_decay_linear(
+        _delta(ctx.c * 0.35 + ctx.vwap * 0.65, 2), 3))
+    b = _g191_tsrank(
+        _decay_linear(_abs(_corr(_ts_mean(ctx.v, 180), ctx.c, 13)), 5), 15)
+    return -_max2(a, b)
+
+
+def _g093(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM((OPEN>=DELAY(OPEN,1)?0:MAX((OPEN-LOW),(OPEN-DELAY(OPEN,1)))),20)
+    do1 = _delay(ctx.o, 1)
+    inner = _tern(_g191_cmp(ctx.o, "ge", do1), 0.0,
+                  _max2(ctx.o - ctx.l, ctx.o - do1))
+    return _ts_sum(inner, 20)
+
+
+def _g094(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM((CLOSE>DELAY(CLOSE,1)?VOLUME:(CLOSE<DELAY(CLOSE,1)?-VOLUME:0)),30)
+    dc = _delay(ctx.c, 1)
+    inner = _tern(_g191_cmp(ctx.c, "gt", dc), ctx.v,
+                  _tern(_g191_cmp(ctx.c, "lt", dc), -ctx.v, 0.0))
+    return _ts_sum(inner, 30)
+
+
+def _g095(ctx: _G191Ctx) -> pd.DataFrame:
+    # STD(AMOUNT,20)
+    return _ts_std(ctx.amount(), 20)
+
+
+def _g096(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(SMA((CLOSE-TSMIN(LOW,9))/(TSMAX(HIGH,9)-TSMIN(LOW,9))*100,3,1),3,1)
+    a = (ctx.c - _ts_min(ctx.l, 9)) / (_ts_max(ctx.h, 9) - _ts_min(ctx.l, 9)) * 100
+    return _g191_sma(_g191_sma(a, 3, 1), 3, 1)
+
+
+def _g097(ctx: _G191Ctx) -> pd.DataFrame:
+    # STD(VOLUME,10)
+    return _ts_std(ctx.v, 10)
+
+
+def _g098(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((((DELTA((SUM(CLOSE, 100) / 100), 100) / DELAY(CLOSE, 100)) < 0.05) || ((DELTA((SUM(CLOSE, 100) / 100), 100) / DELAY(CLOSE, 100)) == 0.05)) ? (-1 * (CLOSE - TSMIN(CLOSE, 100))) : (-1 * DELTA(CLOSE, 3)))
+    x = _delta(_ts_sum(ctx.c, 100) / 100, 100) / _delay(ctx.c, 100)
+    cond = _max2(_g191_cmp(x, "lt", 0.05), _g191_cmp(x, "eq", 0.05))
+    return _tern(cond, -(ctx.c - _ts_min(ctx.c, 100)), -_delta(ctx.c, 3))
+
+
+def _g099(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * RANK(COVIANCE(RANK(CLOSE), RANK(VOLUME), 5)))
+    return -ctx.rank(_cov(ctx.rank(ctx.c), ctx.rank(ctx.v), 5))
+
+
+def _g100(ctx: _G191Ctx) -> pd.DataFrame:
+    # STD(VOLUME,20)
+    return _ts_std(ctx.v, 20)
+
+
+def _g101(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((RANK(CORR(CLOSE, SUM(MEAN(VOLUME,30), 37), 15)) < RANK(CORR(RANK(((HIGH * 0.1) + (VWAP * 0.9))), RANK(VOLUME), 11))) * -1)
+    a = ctx.rank(_corr(ctx.c, _ts_sum(_ts_mean(ctx.v, 30), 37), 15))
+    b = ctx.rank(_corr(ctx.rank(ctx.h * 0.1 + ctx.vwap * 0.9),
+                       ctx.rank(ctx.v), 11))
+    return -_g191_cmp(a, "lt", b)
+
+
+def _g102(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(MAX(VOLUME-DELAY(VOLUME,1),0),6,1)/SMA(ABS(VOLUME-DELAY(VOLUME,1)),6,1)*100
+    d = ctx.v - _delay(ctx.v, 1)
+    return _g191_sma(np.maximum(d, 0.0), 6, 1) \
+        / _g191_sma(_abs(d), 6, 1) * 100
+
+
+def _g103(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((20-LOWDAY(LOW,20))/20)*100
+    return (20 - _g191_lowday(ctx.l, 20)) / 20 * 100
+
+
+def _g104(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * (DELTA(CORR(HIGH, VOLUME, 5), 5) * RANK(STD(CLOSE, 20))))
+    # 注：DELTA(...,5) 滞后 5（DolphinDB 原版误用 4）。
+    return -(_delta(_corr(ctx.h, ctx.v, 5), 5) * ctx.rank(_ts_std(ctx.c, 20)))
+
+
+def _g105(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * CORR(RANK(OPEN), RANK(VOLUME), 10))
+    return -_corr(ctx.rank(ctx.o), ctx.rank(ctx.v), 10)
+
+
+def _g106(ctx: _G191Ctx) -> pd.DataFrame:
+    # CLOSE-DELAY(CLOSE,20)
+    return ctx.c - _delay(ctx.c, 20)
+
+
+def _g107(ctx: _G191Ctx) -> pd.DataFrame:
+    # (((-1 * RANK((OPEN - DELAY(HIGH, 1)))) * RANK((OPEN - DELAY(CLOSE, 1)))) * RANK((OPEN - DELAY(LOW, 1))))
+    return -ctx.rank(ctx.o - _delay(ctx.h, 1)) \
+        * ctx.rank(ctx.o - _delay(ctx.c, 1)) \
+        * ctx.rank(ctx.o - _delay(ctx.l, 1))
+
+
+def _g108(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((RANK((HIGH - MIN(HIGH, 2)))^RANK(CORR((VWAP), (MEAN(VOLUME,120)), 6))) * -1)
+    # 注：MIN(HIGH,2) 按滚动 2 日最小值（DolphinDB 原版误用逐元素比较）。
+    return -ctx.rank(ctx.h - _ts_min(ctx.h, 2)) \
+        .pow(ctx.rank(_corr(ctx.vwap, _ts_mean(ctx.v, 120), 6)))
+
+
+def _g109(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(HIGH-LOW,10,2)/SMA(SMA(HIGH-LOW,10,2),10,2)
+    a = _g191_sma(ctx.h - ctx.l, 10, 2)
+    return a / _g191_sma(a, 10, 2)
+
+
+def _g110(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM(MAX(0,HIGH-DELAY(CLOSE,1)),20)/SUM(MAX(0,DELAY(CLOSE,1)-LOW),20)*100
+    dc = _delay(ctx.c, 1)
+    num = _ts_sum(np.maximum(0.0, ctx.h - dc), 20)
+    den = _ts_sum(np.maximum(0.0, dc - ctx.l), 20)
+    return num / den * 100
+
+
+def _g111(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(VOL*((CLOSE-LOW)-(HIGH-CLOSE))/(HIGH-LOW),11,2)-SMA(VOL*((CLOSE-LOW)-(HIGH-CLOSE))/(HIGH-LOW),4,2)
+    a = ctx.v * ((ctx.c - ctx.l) - (ctx.h - ctx.c)) / (ctx.h - ctx.l)
+    return _g191_sma(a, 11, 2) - _g191_sma(a, 4, 2)
+
+
+def _g112(ctx: _G191Ctx) -> pd.DataFrame:
+    # (SUM((CLOSE-DELAY(CLOSE,1)>0?CLOSE-DELAY(CLOSE,1):0),12)-SUM((CLOSE-DELAY(CLOSE,1)<0?ABS(CLOSE-DELAY(CLOSE,1)):0),12))/
+    #  (SUM(涨项,12)+SUM(跌项,12))*100
+    d = ctx.c - _delay(ctx.c, 1)
+    up = _tern(_g191_cmp(d, "gt", 0.0), d, 0.0)
+    dn = _tern(_g191_cmp(d, "lt", 0.0), _abs(d), 0.0)
+    sum_up = _ts_sum(up, 12)
+    sum_dn = _ts_sum(dn, 12)
+    return (sum_up - sum_dn) / (sum_up + sum_dn) * 100
+
+
+def _g113(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * ((RANK((SUM(DELAY(CLOSE, 5), 20) / 20)) * CORR(CLOSE, VOLUME, 2)) * RANK(CORR(SUM(CLOSE, 5), SUM(CLOSE, 20), 2))))
+    return -ctx.rank(_ts_sum(_delay(ctx.c, 5), 20) / 20) \
+        * _corr(ctx.c, ctx.v, 2) \
+        * ctx.rank(_corr(_ts_sum(ctx.c, 5), _ts_sum(ctx.c, 20), 2))
+
+
+def _g114(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((RANK(DELAY(((HIGH - LOW) / (SUM(CLOSE, 5) / 5)), 2)) * RANK(RANK(VOLUME))) / (((HIGH - LOW) / (SUM(CLOSE, 5) / 5)) / (VWAP - CLOSE)))
+    x = (ctx.h - ctx.l) / (_ts_sum(ctx.c, 5) / 5)
+    num = ctx.rank(_delay(x, 2)) * ctx.rank(ctx.rank(ctx.v))
+    den = x / (ctx.vwap - ctx.c)
+    return num / den
+
+
+def _g115(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(CORR(((HIGH * 0.9) + (CLOSE * 0.1)), MEAN(VOLUME,30), 10))^RANK(CORR(TSRANK(((HIGH + LOW) / 2), 4), TSRANK(VOLUME, 10), 7)))
+    a = ctx.rank(_corr(ctx.h * 0.9 + ctx.c * 0.1, _ts_mean(ctx.v, 30), 10))
+    b = ctx.rank(_corr(_g191_tsrank((ctx.h + ctx.l) / 2, 4),
+                       _g191_tsrank(ctx.v, 10), 7))
+    return a.pow(b)
+
+
+def _g116(ctx: _G191Ctx) -> pd.DataFrame:
+    # REGBETA(CLOSE,SEQUENCE,20)（SEQUENCE 补窗口 20）
+    return _g191_trend_slope(ctx.c, 20)
+
+
+def _g117(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((TSRANK(VOLUME, 32) * (1 - TSRANK(((CLOSE + HIGH) - LOW), 16))) * (1 - TSRANK(RET, 32)))
+    return _g191_tsrank(ctx.v, 32) \
+        * (1 - _g191_tsrank(ctx.c + ctx.h - ctx.l, 16)) \
+        * (1 - _g191_tsrank(ctx.ret, 32))
+
+
+def _g118(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM(HIGH-OPEN,20)/SUM(OPEN-LOW,20)*100
+    return _ts_sum(ctx.h - ctx.o, 20) / _ts_sum(ctx.o - ctx.l, 20) * 100
+
+
+def _g119(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(DECAYLINEAR(CORR(VWAP, SUM(MEAN(VOLUME,5), 26), 5), 7)) - RANK(DECAYLINEAR(TSRANK(MIN(CORR(RANK(OPEN), RANK(MEAN(VOLUME,15)), 21), 9), 7), 8)))
+    # 注：MIN(CORR,9) 按滚动 9 日最小值（DolphinDB 原版误用逐元素比较）。
+    a = ctx.rank(_decay_linear(
+        _corr(ctx.vwap, _ts_sum(_ts_mean(ctx.v, 5), 26), 5), 7))
+    b = ctx.rank(_decay_linear(_g191_tsrank(
+        _ts_min(_corr(ctx.rank(ctx.o), ctx.rank(_ts_mean(ctx.v, 15)), 21),
+                9), 7), 8))
+    return a - b
+
+
+def _g120(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK((VWAP - CLOSE)) / RANK((VWAP + CLOSE)))
+    return ctx.rank(ctx.vwap - ctx.c) / ctx.rank(ctx.vwap + ctx.c)
+
+
+def _g121(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((RANK((VWAP - MIN(VWAP, 12)))^TSRANK(CORR(TSRANK(VWAP, 20), TSRANK(MEAN(VOLUME,60), 2), 18), 3)) * -1)
+    # 注：MIN(VWAP,12) 按滚动 12 日最小值（DolphinDB 原版误用逐元素比较）。
+    a = ctx.rank(ctx.vwap - _ts_min(ctx.vwap, 12))
+    b = _g191_tsrank(
+        _corr(_g191_tsrank(ctx.vwap, 20),
+              _g191_tsrank(_ts_mean(ctx.v, 60), 2), 18), 3)
+    return -a.pow(b)
+
+
+def _g122(ctx: _G191Ctx) -> pd.DataFrame:
+    # (SMA(SMA(SMA(LOG(CLOSE),13,2),13,2),13,2)-DELAY(SMA(SMA(SMA(LOG(CLOSE),13,2),13,2),13,2),1))/
+    #  DELAY(SMA(SMA(SMA(LOG(CLOSE),13,2),13,2),13,2),1)
+    a = _g191_sma(_g191_sma(_g191_sma(_log(ctx.c), 13, 2), 13, 2), 13, 2)
+    return (a - _delay(a, 1)) / _delay(a, 1)
+
+
+def _g123(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((RANK(CORR(SUM(((HIGH + LOW) / 2), 20), SUM(MEAN(VOLUME,60), 20), 9)) < RANK(CORR(LOW, VOLUME, 6))) * -1)
+    a = ctx.rank(_corr(_ts_sum((ctx.h + ctx.l) / 2, 20),
+                       _ts_sum(_ts_mean(ctx.v, 60), 20), 9))
+    b = ctx.rank(_corr(ctx.l, ctx.v, 6))
+    return -_g191_cmp(a, "lt", b)
+
+
+def _g124(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE - VWAP) / DECAYLINEAR(RANK(TSMAX(CLOSE, 30)),2)
+    return (ctx.c - ctx.vwap) \
+        / _decay_linear(ctx.rank(_ts_max(ctx.c, 30)), 2)
+
+
+def _g125(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(DECAYLINEAR(CORR((VWAP), MEAN(VOLUME,80),17), 20)) / RANK(DECAYLINEAR(DELTA(((CLOSE * 0.5) + (VWAP * 0.5)), 3), 16)))
+    a = ctx.rank(_decay_linear(_corr(ctx.vwap, _ts_mean(ctx.v, 80), 17), 20))
+    b = ctx.rank(_decay_linear(_delta(ctx.c * 0.5 + ctx.vwap * 0.5, 3), 16))
+    return a / b
+
+
+def _g126(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE+HIGH+LOW)/3
+    return (ctx.c + ctx.h + ctx.l) / 3
+
+
+def _g127(ctx: _G191Ctx) -> pd.DataFrame:
+    # (MEAN((100*(CLOSE-MAX(CLOSE,12))/(MAX(CLOSE,12)))^2))^(1/2)
+    # 外层 MEAN 窗口研报未给，按 DolphinDB 基准补 12。
+    a = _ts_max(ctx.c, 12)
+    return np.sqrt(_ts_mean((100 * (ctx.c - a) / a) ** 2, 12))
+
+
+def _g128(ctx: _G191Ctx) -> pd.DataFrame:
+    # 100-(100/(1+SUM(((HIGH+LOW+CLOSE)/3>DELAY((HIGH+LOW+CLOSE)/3,1)?(HIGH+LOW+CLOSE)/3*VOLUME:0),14)/
+    #  SUM(((HIGH+LOW+CLOSE)/3<DELAY((HIGH+LOW+CLOSE)/3,1)?(HIGH+LOW+CLOSE)/3*VOLUME:0), 14)))
+    tp = (ctx.h + ctx.l + ctx.c) / 3
+    dtp = _delay(tp, 1)
+    up = _tern(_g191_cmp(tp, "gt", dtp), tp * ctx.v, 0.0)
+    dn = _tern(_g191_cmp(tp, "lt", dtp), tp * ctx.v, 0.0)
+    ratio = _ts_sum(up, 14) / _ts_sum(dn, 14)
+    return 100 - 100 / (1 + ratio)
+
+
+def _g129(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM((CLOSE-DELAY(CLOSE,1)<0?ABS(CLOSE-DELAY(CLOSE,1)):0),12)
+    d = ctx.c - _delay(ctx.c, 1)
+    return _ts_sum(_tern(_g191_cmp(d, "lt", 0.0), _abs(d), 0.0), 12)
+
+
+def _g130(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(DECAYLINEAR(CORR(((HIGH + LOW) / 2), MEAN(VOLUME,40), 9), 10)) / RANK(DECAYLINEAR(CORR(RANK(VWAP), RANK(VOLUME), 7),3)))
+    a = ctx.rank(_decay_linear(
+        _corr((ctx.h + ctx.l) / 2, _ts_mean(ctx.v, 40), 9), 10))
+    b = ctx.rank(_decay_linear(
+        _corr(ctx.rank(ctx.vwap), ctx.rank(ctx.v), 7), 3))
+    return a / b
+
+
+def _g131(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(DELAT(VWAP, 1))^TSRANK(CORR(CLOSE,MEAN(VOLUME,50), 18), 18))
+    a = ctx.rank(_delta(ctx.vwap, 1))
+    b = _g191_tsrank(_corr(ctx.c, _ts_mean(ctx.v, 50), 18), 18)
+    return a.pow(b)
+
+
+def _g132(ctx: _G191Ctx) -> pd.DataFrame:
+    # MEAN(AMOUNT,20)
+    return _ts_mean(ctx.amount(), 20)
+
+
+def _g133(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((20-HIGHDAY(HIGH,20))/20)*100-((20-LOWDAY(LOW,20))/20)*100
+    return (20 - _g191_highday(ctx.h, 20)) / 20 * 100 \
+        - (20 - _g191_lowday(ctx.l, 20)) / 20 * 100
+
+
+def _g134(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE-DELAY(CLOSE,12))/DELAY(CLOSE,12)*VOLUME
+    dc12 = _delay(ctx.c, 12)
+    return (ctx.c - dc12) / dc12 * ctx.v
+
+
+def _g135(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(DELAY(CLOSE/DELAY(CLOSE,20),1),20,1)
+    a = _delay(ctx.c / _delay(ctx.c, 20), 1)
+    return _g191_sma(a, 20, 1)
+
+
+def _g136(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((-1 * RANK(DELTA(RET, 3))) * CORR(OPEN, VOLUME, 10))
+    return -ctx.rank(_delta(ctx.ret, 3)) * _corr(ctx.o, ctx.v, 10)
+
+
+def _g137(ctx: _G191Ctx) -> pd.DataFrame:
+    # 16*(CLOSE-DELAY(CLOSE,1)+(CLOSE-OPEN)/2+DELAY(CLOSE,1)-DELAY(OPEN,1))/
+    #  ((ABS(HIGH-DELAY(CLOSE,1))>ABS(LOW-DELAY(CLOSE,1)) & ABS(HIGH-DELAY(CLOSE,1))>ABS(HIGH-DELAY(LOW,1))?
+    #     ABS(HIGH-DELAY(CLOSE,1))+ABS(LOW-DELAY(CLOSE,1))/2+ABS(DELAY(CLOSE,1)-DELAY(OPEN,1))/4:
+    #    (ABS(LOW-DELAY(CLOSE,1))>ABS(HIGH-DELAY(LOW,1)) & ABS(LOW-DELAY(CLOSE,1))>ABS(HIGH-DELAY(CLOSE,1))?
+    #      ABS(LOW-DELAY(CLOSE,1))+ABS(HIGH-DELAY(CLOSE,1))/2+ABS(DELAY(CLOSE,1)-DELAY(OPEN,1))/4:
+    #      ABS(HIGH-DELAY(LOW,1))+ABS(DELAY(CLOSE,1)-DELAY(OPEN,1))/4)))
+    #  *MAX(ABS(HIGH-DELAY(CLOSE,1)),ABS(LOW-DELAY(CLOSE,1)))
+    dc1 = _delay(ctx.c, 1)
+    do1 = _delay(ctx.o, 1)
+    dl1 = _delay(ctx.l, 1)
+    a = _abs(ctx.h - dc1)
+    b = _abs(ctx.l - dc1)
+    cc = _abs(ctx.h - dl1)
+    tmp1 = 16 * (ctx.c - dc1 + (ctx.c - ctx.o) / 2 + dc1 - do1)
+    cond1 = _g191_cmp(a, "gt", b) * _g191_cmp(a, "gt", cc)
+    v1 = a + b / 2 + _abs(dc1 - do1) / 4
+    cond2 = _g191_cmp(b, "gt", cc) * _g191_cmp(b, "gt", a)
+    v2 = b + a / 2 + _abs(dc1 - do1) / 4
+    v3 = cc + _abs(dc1 - do1) / 4
+    tmp2 = np.where(cond1.fillna(0.0).astype(bool), v1,
+                    np.where(cond2.fillna(0.0).astype(bool), v2, v3))
+    return tmp1 / tmp2 * _max2(a, b)
+
+
+def _g138(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((RANK(DECAYLINEAR(DELTA((((LOW * 0.7) + (VWAP *0.3))), 3), 20)) - TSRANK(DECAYLINEAR(TSRANK(CORR(TSRANK(LOW, 8), TSRANK(MEAN(VOLUME,60), 17), 5), 19), 16), 7)) * -1)
+    a = ctx.rank(_decay_linear(_delta(ctx.l * 0.7 + ctx.vwap * 0.3, 3), 20))
+    b = _g191_tsrank(_decay_linear(_g191_tsrank(
+        _corr(_g191_tsrank(ctx.l, 8), _g191_tsrank(_ts_mean(ctx.v, 60), 17),
+              5), 19), 16), 7)
+    return -(a - b)
+
+
+def _g139(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1 * CORR(OPEN, VOLUME, 10))
+    return -_corr(ctx.o, ctx.v, 10)
+
+
+def _g140(ctx: _G191Ctx) -> pd.DataFrame:
+    # MIN(RANK(DECAYLINEAR(((RANK(OPEN) + RANK(LOW)) - (RANK(HIGH) + RANK(CLOSE))), 8)), TSRANK(DECAYLINEAR(CORR(TSRANK(CLOSE, 8), TSRANK(MEAN(VOLUME,60), 20), 8), 7), 3))
+    a = ctx.rank(_decay_linear(
+        ctx.rank(ctx.o) + ctx.rank(ctx.l) - (ctx.rank(ctx.h) + ctx.rank(ctx.c)),
+        8))
+    b = _g191_tsrank(_decay_linear(
+        _corr(_g191_tsrank(ctx.c, 8), _g191_tsrank(_ts_mean(ctx.v, 60), 20),
+              8), 7), 3)
+    return _min2(a, b)
+
+
+def _g141(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(CORR(RANK(HIGH), RANK(MEAN(VOLUME,15)), 9))* -1)
+    return -ctx.rank(_corr(ctx.rank(ctx.h), ctx.rank(_ts_mean(ctx.v, 15)), 9))
+
+
+def _g142(ctx: _G191Ctx) -> pd.DataFrame:
+    # (((-1 * RANK(TSRANK(CLOSE, 10))) * RANK(DELTA(DELTA(CLOSE, 1), 1))) * RANK(TSRANK((VOLUME /MEAN(VOLUME,20)), 5)))
+    return -ctx.rank(_g191_tsrank(ctx.c, 10)) \
+        * ctx.rank(_delta(_delta(ctx.c, 1), 1)) \
+        * ctx.rank(_g191_tsrank(ctx.v / _ts_mean(ctx.v, 20), 5))
+
+
+def _g143(ctx: _G191Ctx) -> pd.DataFrame:
+    # CLOSE>DELAY(CLOSE,1)?(CLOSE-DELAY(CLOSE,1))/DELAY(CLOSE,1)*SELF:SELF
+    # SELF=前一日因子值，初值 1.0；停牌日输出 NaN 并保持状态，
+    # DELAY 按个股自身交易日（跳过停牌日）。
+    close = ctx.c.to_numpy(dtype=float)
+    out = np.full_like(close, np.nan)
+    for j in range(close.shape[1]):
+        prev = 1.0
+        prev_close = np.nan
+        for t in range(close.shape[0]):
+            ct = close[t, j]
+            if np.isnan(ct):
+                continue
+            if np.isnan(prev_close):
+                out[t, j] = prev
+            else:
+                if ct > prev_close:
+                    prev *= ct / prev_close - 1.0
+                out[t, j] = prev
+            prev_close = ct
+    return pd.DataFrame(out, index=ctx.c.index, columns=ctx.c.columns)
+
+
+def _g144(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUMIF(ABS(CLOSE/DELAY(CLOSE,1)-1)/AMOUNT,20,CLOSE<DELAY(CLOSE, 1))/COUNT(CLOSE<DELAY(CLOSE, 1),20)
+    dc = _delay(ctx.c, 1)
+    val = _abs(ctx.c / dc - 1) / ctx.amount()
+    cond = _g191_cmp(ctx.c, "lt", dc)
+    num = _ts_sum(val * cond.fillna(0.0), 20)
+    return num / _g191_count(cond, 20)
+
+
+def _g145(ctx: _G191Ctx) -> pd.DataFrame:
+    # (MEAN(VOLUME,9)-MEAN(VOLUME,26))/MEAN(VOLUME,12)*100
+    return (_ts_mean(ctx.v, 9) - _ts_mean(ctx.v, 26)) \
+        / _ts_mean(ctx.v, 12) * 100
+
+
+def _g146(ctx: _G191Ctx) -> pd.DataFrame:
+    # MEAN((CLOSE-DELAY(CLOSE,1))/DELAY(CLOSE,1)-SMA(...,61,2),20)*
+    #  ((CLOSE-DELAY(CLOSE,1))/DELAY(CLOSE,1)-SMA(...,61,2))/
+    #  SMA((A-(A-SMA(A,61,2)))^2,60)（第三参数 m 未给，按默认 m=1）
+    # 注：内层相减抵消后分母=SMA(SMA(A,61,2)^2,60,1)；DolphinDB 原版丢
+    # (A−B) 因子且分母用普通均值，另一公开移植取 SMA((A−B)²,60,2)，
+    # 本移植按公式文本字面实现。
+    dc = _delay(ctx.c, 1)
+    a = (ctx.c - dc) / dc
+    b = _g191_sma(a, 61, 2)
+    return _ts_mean(a - b, 20) * (a - b) / _g191_sma(b ** 2, 60, 1)
+
+
+def _g147(ctx: _G191Ctx) -> pd.DataFrame:
+    # REGBETA(MEAN(CLOSE,12),SEQUENCE(12))（回归窗口按 SEQUENCE 长度补 12）
+    return _g191_trend_slope(_ts_mean(ctx.c, 12), 12)
+
+
+def _g148(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((RANK(CORR((OPEN), SUM(MEAN(VOLUME,60), 9), 6)) < RANK((OPEN - TSMIN(OPEN, 14)))) * -1)
+    a = ctx.rank(_corr(ctx.o, _ts_sum(_ts_mean(ctx.v, 60), 9), 6))
+    b = ctx.rank(ctx.o - _ts_min(ctx.o, 14))
+    return -_g191_cmp(a, "lt", b)
+
+
+def _g149(ctx: _G191Ctx) -> pd.DataFrame:
+    # REGBETA(FILTER(CLOSE/DELAY(CLOSE,1)-1,BANCHMARKINDEXCLOSE<DELAY(BANCHMARKINDEXCLOSE,1)),
+    #         FILTER(BANCHMARKINDEXCLOSE/DELAY(BANCHMARKINDEXCLOSE,1)-1,BANCHMARKINDEXCLOSE<DELAY(BANCHMARKINDEXCLOSE,1)),252)
+    iclose = ctx.idx_close("gtja149")
+    if ctx._idx_close is None:
+        return _nan_like(ctx.c)
+    stock_ret = ctx.ret
+    idx_ret = iclose / _delay(iclose, 1) - 1
+    sel = _g191_cmp(iclose, "lt", _delay(iclose, 1))
+    return _g191_beta_selected(stock_ret, idx_ret, sel, 252)
+
+
+def _g150(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE+HIGH+LOW)/3*VOLUME
+    return (ctx.c + ctx.h + ctx.l) / 3 * ctx.v
+
+
+def _g151(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(CLOSE-DELAY(CLOSE,20),20,1)
+    return _g191_sma(ctx.c - _delay(ctx.c, 20), 20, 1)
+
+
+def _g152(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(MEAN(DELAY(SMA(DELAY(CLOSE/DELAY(CLOSE,9),1),9,1),1),12)-MEAN(DELAY(SMA(DELAY(CLOSE/DELAY(CLOSE,9),1),9,1),1),26),9,1)
+    a = _g191_sma(_delay(ctx.c / _delay(ctx.c, 9), 1), 9, 1)
+    b = _ts_mean(_delay(a, 1), 12) - _ts_mean(_delay(a, 1), 26)
+    return _g191_sma(b, 9, 1)
+
+
+def _g153(ctx: _G191Ctx) -> pd.DataFrame:
+    # (MEAN(CLOSE,3)+MEAN(CLOSE,6)+MEAN(CLOSE,12)+MEAN(CLOSE,24))/4
+    return (_ts_mean(ctx.c, 3) + _ts_mean(ctx.c, 6) + _ts_mean(ctx.c, 12)
+            + _ts_mean(ctx.c, 24)) / 4
+
+
+def _g154(ctx: _G191Ctx) -> pd.DataFrame:
+    # (((VWAP - MIN(VWAP, 16))) < (CORR(VWAP, MEAN(VOLUME,180), 18)))
+    # 注：MIN(VWAP,16) 按滚动 16 日最小值（DolphinDB 原版误用逐元素比较）。
+    return _g191_cmp(ctx.vwap - _ts_min(ctx.vwap, 16), "lt",
+                     _corr(ctx.vwap, _ts_mean(ctx.v, 180), 18))
+
+
+def _g155(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(VOLUME,13,2)-SMA(VOLUME,27,2)-SMA(SMA(VOLUME,13,2)-SMA(VOLUME,27,2),10,2)
+    a = _g191_sma(ctx.v, 13, 2)
+    b = _g191_sma(a, 27, 2)
+    return a - b - _g191_sma(a - b, 10, 2)
+
+
+def _g156(ctx: _G191Ctx) -> pd.DataFrame:
+    # (MAX(RANK(DECAYLINEAR(DELTA(VWAP, 5), 3)), RANK(DECAYLINEAR(((DELTA(((OPEN * 0.15) + (LOW *0.85)), 2) / ((OPEN * 0.15) + (LOW * 0.85))) * -1), 3))) * -1)
+    a = ctx.rank(_decay_linear(_delta(ctx.vwap, 5), 3))
+    x = ctx.o * 0.15 + ctx.l * 0.85
+    b = ctx.rank(_decay_linear(-_delta(x, 2) / x, 3))
+    return -_max2(a, b)
+
+
+def _g157(ctx: _G191Ctx) -> pd.DataFrame:
+    # (MIN(PROD(RANK(RANK(LOG(SUM(TSMIN(RANK(RANK((-1 * RANK(DELTA((CLOSE - 1), 5))))), 2), 1)))), 1), 5) + TSRANK(DELAY((-1 * RET), 6), 5))
+    # PROD(...,1)/SUM(...,1) 为恒等；外层 MIN(...,5) 对分位秩为恒等，
+    # 按 DolphinDB 字面保留逐元素 min(frame, 5)。
+    inner = -ctx.rank(_delta(ctx.c - 1, 5))
+    deep = ctx.rank(ctx.rank(inner))
+    part = ctx.rank(ctx.rank(_log(_ts_min(deep, 2))))
+    part = np.minimum(part, 5.0)
+    return part + _g191_tsrank(_delay(-ctx.ret, 6), 5)
+
+
+def _g158(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((HIGH-SMA(CLOSE,15,2))-(LOW-SMA(CLOSE,15,2)))/CLOSE
+    a = _g191_sma(ctx.c, 15, 2)
+    return ((ctx.h - a) - (ctx.l - a)) / ctx.c
+
+
+def _g159(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((CLOSE-SUM(MIN(LOW,DELAY(CLOSE,1)),6))/SUM(MAX(HGIH,DELAY(CLOSE,1))-MIN(LOW,DELAY(CLOSE,1)),6) *12*24
+    #  +(CLOSE-SUM(MIN(LOW,DELAY(CLOSE,1)),12))/SUM(MAX(HGIH,DELAY(CLOSE,1))-MIN(LOW,DELAY(CLOSE,1)),12)*6*24
+    #  +(CLOSE-SUM(MIN(LOW,DELAY(CLOSE,1)),24))/SUM(MAX(HGIH,DELAY(CLOSE,1))-MIN(LOW,DELAY(CLOSE,1)),24)*6*24)
+    #  *100/(6*12+6*24+12*24)
+    # 注：HGIH 按 HIGH 的拼写候选修正；权重按原文字面（第三项 6×24 与
+    # 分母 6×12 的不对称如实保留）。
+    dc = _delay(ctx.c, 1)
+    mn = _min2(ctx.l, dc)
+    rng = _max2(ctx.h, dc) - mn
+    tmp1 = (ctx.c - _ts_sum(mn, 6)) / _ts_sum(rng, 6) * 12 * 24
+    tmp2 = (ctx.c - _ts_sum(mn, 12)) / _ts_sum(rng, 12) * 6 * 24
+    tmp3 = (ctx.c - _ts_sum(mn, 24)) / _ts_sum(rng, 24) * 6 * 24
+    return (tmp1 + tmp2 + tmp3) * 100 / (6 * 12 + 6 * 24 + 12 * 24)
+
+
+def _g160(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA((CLOSE<=DELAY(CLOSE,1)?STD(CLOSE,20):0),20,1)
+    a = _tern(_g191_cmp(ctx.c, "le", _delay(ctx.c, 1)),
+              _ts_std(ctx.c, 20), 0.0)
+    return _g191_sma(a, 20, 1)
+
+
+def _g161(ctx: _G191Ctx) -> pd.DataFrame:
+    # MEAN(MAX(MAX((HIGH-LOW),ABS(DELAY(CLOSE,1)-HIGH)),ABS(DELAY(CLOSE,1)-LOW)),12)
+    dc = _delay(ctx.c, 1)
+    tr = _max2(_max2(ctx.h - ctx.l, _abs(dc - ctx.h)), _abs(dc - ctx.l))
+    return _ts_mean(tr, 12)
+
+
+def _g162(ctx: _G191Ctx) -> pd.DataFrame:
+    # (SMA(MAX(CLOSE-DELAY(CLOSE,1),0),12,1)/SMA(ABS(CLOSE-DELAY(CLOSE,1)),12,1)*100
+    #  -MIN(该RSI,12))/(MAX(该RSI,12)-MIN(该RSI,12))
+    d = ctx.c - _delay(ctx.c, 1)
+    rsi = _g191_sma(np.maximum(d, 0.0), 12, 1) \
+        / _g191_sma(_abs(d), 12, 1) * 100
+    return (rsi - _ts_min(rsi, 12)) \
+        / (_ts_max(rsi, 12) - _ts_min(rsi, 12))
+
+
+def _g163(ctx: _G191Ctx) -> pd.DataFrame:
+    # RANK(((((-1 * RET) * MEAN(VOLUME,20)) * VWAP) * (HIGH - CLOSE)))
+    return ctx.rank(-ctx.ret * _ts_mean(ctx.v, 20) * ctx.vwap
+                    * (ctx.h - ctx.c))
+
+
+def _g164(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA((((CLOSE>DELAY(CLOSE,1))?1/(CLOSE-DELAY(CLOSE,1)):1)
+    #      -MIN(((CLOSE>DELAY(CLOSE,1))?1/(CLOSE-DELAY(CLOSE,1)):1),12))/(HIGH-LOW)*100,13,2)
+    dc = _delay(ctx.c, 1)
+    a = _tern(_g191_cmp(ctx.c, "gt", dc), 1.0 / (ctx.c - dc), 1.0)
+    b = (a - _ts_min(a, 12)) / (ctx.h - ctx.l) * 100
+    return _g191_sma(b, 13, 2)
+
+
+def _g165(ctx: _G191Ctx) -> pd.DataFrame:
+    # MAX(SUMAC(CLOSE-MEAN(CLOSE,48)))-MIN(SUMAC(CLOSE-MEAN(CLOSE,48)))/STD(CLOSE,48)
+    # SUMAC 窗口按 48 补；MAX/MIN 按无未来函数约定取截至当日的扩展极值，
+    # 整个极差除以 STD（见模块 docstring 的 Alpha191 口径）。
+    roll = _ts_sum(ctx.c - _ts_mean(ctx.c, 48), 48)
+    rng = _g191_expanding_range(roll, 48)
+    return rng / _ts_std(ctx.c, 48)
+
+
+def _g166(ctx: _G191Ctx) -> pd.DataFrame:
+    # -20* ( 20-1 ) ^1.5*SUM(CLOSE/DELAY(CLOSE,1)-1-MEAN(CLOSE/DELAY(CLOSE,1)-1,20),20)/
+    #  ((20-1)*(20-2)(SUM((CLOSE/DELAY(CLOSE,1),20)^2,20))^1.5)
+    # 原式损坏不可唯一恢复；分母按 DolphinDB 基准的字面解读
+    # 19·18·(Σ(MEAN(R,20)²,20))^1.5。
+    r = ctx.c / _delay(ctx.c, 1) - 1
+    num = -20 * (19 ** 1.5) * _ts_sum(r - _ts_mean(r, 20), 20)
+    den = 19 * 18 * (_ts_sum(_ts_mean(r, 20) ** 2, 20) ** 1.5)
+    return num / den
+
+
+def _g167(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM((CLOSE-DELAY(CLOSE,1)>0?CLOSE-DELAY(CLOSE,1):0),12)
+    d = ctx.c - _delay(ctx.c, 1)
+    return _ts_sum(_tern(_g191_cmp(d, "gt", 0.0), d, 0.0), 12)
+
+
+def _g168(ctx: _G191Ctx) -> pd.DataFrame:
+    # (-1*VOLUME/MEAN(VOLUME,20))
+    return -ctx.v / _ts_mean(ctx.v, 20)
+
+
+
+
+
+
+
+
+def _g169(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA(MEAN(DELAY(SMA(CLOSE-DELAY(CLOSE,1),9,1),1),12)-MEAN(DELAY(SMA(CLOSE-DELAY(CLOSE,1),9,1),1), 26),10,1)
+    a = _g191_sma(ctx.c - _delay(ctx.c, 1), 9, 1)
+    b = _ts_mean(_delay(a, 1), 12) - _ts_mean(_delay(a, 1), 26)
+    return _g191_sma(b, 10, 1)
+
+
+def _g170(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((((RANK((1 / CLOSE)) * VOLUME) / MEAN(VOLUME,20)) * ((HIGH * RANK((HIGH - CLOSE))) / (SUM(HIGH, 5) / 5))) - RANK((VWAP - DELAY(VWAP, 5))))
+    part = ctx.rank(1 / ctx.c) * ctx.v / _ts_mean(ctx.v, 20) \
+        * (ctx.h * ctx.rank(ctx.h - ctx.c)) / (_ts_sum(ctx.h, 5) / 5)
+    return part - ctx.rank(ctx.vwap - _delay(ctx.vwap, 5))
+
+
+def _g171(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((-1 * ((LOW - CLOSE) * (OPEN^5))) / ((CLOSE - HIGH) * (CLOSE^5)))
+    return -((ctx.l - ctx.c) * ctx.o ** 5) / ((ctx.c - ctx.h) * ctx.c ** 5)
+
+
+def _g172(ctx: _G191Ctx) -> pd.DataFrame:
+    # MEAN(ABS(SUM((LD>0 & LD>HD)?LD:0,14)*100/SUM(TR,14)-SUM((HD>0 & HD>LD)?HD:0,14)*100/SUM(TR,14))/
+    #  (SUM((LD>0 & LD>HD)?LD:0,14)*100/SUM(TR,14)+SUM((HD>0 & HD>LD)?HD:0,14)*100/SUM(TR,14))*100,6)
+    hd = ctx.h - _delay(ctx.h, 1)
+    ld = _delay(ctx.l, 1) - ctx.l
+    dc = _delay(ctx.c, 1)
+    tr = _max2(_max2(ctx.h - ctx.l, _abs(ctx.h - dc)), _abs(ctx.l - dc))
+    sum1 = _ts_sum(_tern(_g191_cmp(ld, "gt", 0.0) * _g191_cmp(ld, "gt", hd),
+                         ld, 0.0), 14) * 100 / _ts_sum(tr, 14)
+    sum2 = _ts_sum(_tern(_g191_cmp(hd, "gt", 0.0) * _g191_cmp(hd, "gt", ld),
+                         hd, 0.0), 14) * 100 / _ts_sum(tr, 14)
+    return _ts_mean(_abs(sum1 - sum2) / (sum1 + sum2) * 100, 6)
+
+
+def _g173(ctx: _G191Ctx) -> pd.DataFrame:
+    # 3*SMA(CLOSE,13,2)-2*SMA(SMA(CLOSE,13,2),13,2)+SMA(SMA(SMA(LOG(CLOSE),13,2),13,2),13,2)
+    # 注：第三项按公式为 LOG(CLOSE) 的三重 SMA（DolphinDB 原版误用 close）。
+    a = _g191_sma(ctx.c, 13, 2)
+    b = _g191_sma(a, 13, 2)
+    c3 = _g191_sma(_g191_sma(_g191_sma(_log(ctx.c), 13, 2), 13, 2), 13, 2)
+    return 3 * a - 2 * b + c3
+
+
+def _g174(ctx: _G191Ctx) -> pd.DataFrame:
+    # SMA((CLOSE>DELAY(CLOSE,1)?STD(CLOSE,20):0),20,1)
+    a = _tern(_g191_cmp(ctx.c, "gt", _delay(ctx.c, 1)),
+              _ts_std(ctx.c, 20), 0.0)
+    return _g191_sma(a, 20, 1)
+
+
+def _g175(ctx: _G191Ctx) -> pd.DataFrame:
+    # MEAN(MAX(MAX((HIGH-LOW),ABS(DELAY(CLOSE,1)-HIGH)),ABS(DELAY(CLOSE,1)-LOW)),6)
+    dc = _delay(ctx.c, 1)
+    tr = _max2(_max2(ctx.h - ctx.l, _abs(dc - ctx.h)), _abs(dc - ctx.l))
+    return _ts_mean(tr, 6)
+
+
+def _g176(ctx: _G191Ctx) -> pd.DataFrame:
+    # CORR(RANK(((CLOSE - TSMIN(LOW, 12)) / (TSMAX(HIGH, 12) - TSMIN(LOW,12)))), RANK(VOLUME), 6)
+    a = ctx.rank((ctx.c - _ts_min(ctx.l, 12))
+                 / (_ts_max(ctx.h, 12) - _ts_min(ctx.l, 12)))
+    return _corr(a, ctx.rank(ctx.v), 6)
+
+
+def _g177(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((20-HIGHDAY(HIGH,20))/20)*100
+    return (20 - _g191_highday(ctx.h, 20)) / 20 * 100
+
+
+def _g178(ctx: _G191Ctx) -> pd.DataFrame:
+    # (CLOSE-DELAY(CLOSE,1))/DELAY(CLOSE,1)*VOLUME
+    dc = _delay(ctx.c, 1)
+    return (ctx.c - dc) / dc * ctx.v
+
+
+def _g179(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(CORR(VWAP, VOLUME, 4)) *RANK(CORR(RANK(LOW), RANK(MEAN(VOLUME,50)), 12)))
+    a = ctx.rank(_corr(ctx.vwap, ctx.v, 4))
+    b = ctx.rank(_corr(ctx.rank(ctx.l), ctx.rank(_ts_mean(ctx.v, 50)), 12))
+    return a * b
+
+
+def _g180(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((MEAN(VOLUME,20) < VOLUME) ? ((-1 * TSRANK(ABS(DELTA(CLOSE, 7)), 60)) * SIGN(DELTA(CLOSE, 7)) : (-1 * VOLUME)))
+    cond = _g191_cmp(_ts_mean(ctx.v, 20), "lt", ctx.v)
+    d = _delta(ctx.c, 7)
+    return _tern(cond, -_g191_tsrank(_abs(d), 60) * _sign(d), -ctx.v)
+
+
+def _g181(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM(((CLOSE/DELAY(CLOSE,1)-1)-MEAN((CLOSE/DELAY(CLOSE,1)-1),20))-
+    #  (BANCHMARKINDEXCLOSE-MEAN(BANCHMARKINDEXCLOSE,20))^2,20)/
+    #  SUM((BANCHMARKINDEXCLOSE-MEAN(BANCHMARKINDEXCLOSE,20))^3)
+    iclose = ctx.idx_close("gtja181")
+    if ctx._idx_close is None:
+        return _nan_like(ctx.c)
+    r = ctx.ret
+    idx_dev = iclose - _ts_mean(iclose, 20)
+    num = _ts_sum(r - _ts_mean(r, 20) - idx_dev ** 2, 20)
+    return num / _ts_sum(idx_dev ** 3, 20)
+
+
+def _g182(ctx: _G191Ctx) -> pd.DataFrame:
+    # COUNT((CLOSE>OPEN & BANCHMARKINDEXCLOSE>BANCHMARKINDEXOPEN)OR(CLOSE<OPEN & BANCHMARKINDEXCLOSE<BANCHMARKINDEXOPEN),20)/20
+    iopen = ctx.idx_open("gtja182")
+    iclose = ctx.idx_close("gtja182")
+    if ctx._idx_open is None or ctx._idx_close is None:
+        return _nan_like(ctx.c)
+    cond = _max2(_g191_cmp(ctx.c, "gt", ctx.o) * _g191_cmp(iclose, "gt", iopen),
+                 _g191_cmp(ctx.c, "lt", ctx.o) * _g191_cmp(iclose, "lt", iopen))
+    return _g191_count(cond, 20) / 20
+
+
+def _g183(ctx: _G191Ctx) -> pd.DataFrame:
+    # MAX(SUMAC(CLOSE-MEAN(CLOSE,24)))-MIN(SUMAC(CLOSE-MEAN(CLOSE,24)))/STD(CLOSE,24)
+    # 同 alpha165：扩展极值，整个极差除以 STD（窗口 24）。
+    roll = _ts_sum(ctx.c - _ts_mean(ctx.c, 24), 24)
+    rng = _g191_expanding_range(roll, 24)
+    return rng / _ts_std(ctx.c, 24)
+
+
+def _g184(ctx: _G191Ctx) -> pd.DataFrame:
+    # (RANK(CORR(DELAY((OPEN - CLOSE), 1), CLOSE, 200)) + RANK((OPEN - CLOSE)))
+    a = ctx.rank(_corr(_delay(ctx.o - ctx.c, 1), ctx.c, 200))
+    return a + ctx.rank(ctx.o - ctx.c)
+
+
+def _g185(ctx: _G191Ctx) -> pd.DataFrame:
+    # RANK((-1 * ((1 - (OPEN / CLOSE))^2)))
+    return ctx.rank(-(1 - ctx.o / ctx.c) ** 2)
+
+
+def _g186(ctx: _G191Ctx) -> pd.DataFrame:
+    # (MEAN(ABS(SUM((LD>0 & LD>HD)?LD:0,14)*100/SUM(TR,14)-SUM((HD>0 & HD>LD)?HD:0,14)*100/SUM(TR,14))/
+    #  (SUM((LD>0 & LD>HD)?LD:0,14)*100/SUM(TR,14)+SUM((HD>0 & HD>LD)?HD:0,14)*100/SUM(TR,14))*100,6)
+    #  +DELAY(同式 MEAN,6))/2
+    hd = ctx.h - _delay(ctx.h, 1)
+    ld = _delay(ctx.l, 1) - ctx.l
+    dc = _delay(ctx.c, 1)
+    tr = _max2(_max2(ctx.h - ctx.l, _abs(ctx.h - dc)), _abs(ctx.l - dc))
+    sum1 = _ts_sum(_tern(_g191_cmp(ld, "gt", 0.0) * _g191_cmp(ld, "gt", hd),
+                         ld, 0.0), 14) * 100 / _ts_sum(tr, 14)
+    sum2 = _ts_sum(_tern(_g191_cmp(hd, "gt", 0.0) * _g191_cmp(hd, "gt", ld),
+                         hd, 0.0), 14) * 100 / _ts_sum(tr, 14)
+    m6 = _ts_mean(_abs(sum1 - sum2) / (sum1 + sum2) * 100, 6)
+    return (m6 + _delay(m6, 6)) / 2
+
+
+def _g187(ctx: _G191Ctx) -> pd.DataFrame:
+    # SUM((OPEN<=DELAY(OPEN,1)?0:MAX((HIGH-OPEN),(OPEN-DELAY(OPEN,1)))),20)
+    do1 = _delay(ctx.o, 1)
+    inner = _tern(_g191_cmp(ctx.o, "le", do1), 0.0,
+                  _max2(ctx.h - ctx.o, ctx.o - do1))
+    return _ts_sum(inner, 20)
+
+
+def _g188(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((HIGH-LOW–SMA(HIGH-LOW,11,2))/SMA(HIGH-LOW,11,2))*100
+    a = _g191_sma(ctx.h - ctx.l, 11, 2)
+    return (ctx.h - ctx.l - a) / a * 100
+
+
+def _g189(ctx: _G191Ctx) -> pd.DataFrame:
+    # MEAN(ABS(CLOSE-MEAN(CLOSE,6)),6)
+    return _ts_mean(_abs(ctx.c - _ts_mean(ctx.c, 6)), 6)
+
+
+def _g190(ctx: _G191Ctx) -> pd.DataFrame:
+    # LOG((COUNT(CLOSE/DELAY(CLOSE)-1>((CLOSE/DELAY(CLOSE,19))^(1/20)-1),20)-1)*
+    #      (SUMIF(((CLOSE/DELAY(CLOSE)-1-(CLOSE/DELAY(CLOSE,19))^(1/20)-1))^2,20,CLOSE/DELAY(CLOSE)-1<(CLOSE/DELAY(CLOSE,19))^(1/20)-1))/
+    #      ((COUNT((CLOSE/DELAY(CLOSE)-1<(CLOSE/DELAY(CLOSE,19))^(1/20)-1),20))*
+    #       (SUMIF((CLOSE/DELAY(CLOSE)-1-((CLOSE/DELAY(CLOSE,19))^(1/20)-1))^2,20,CLOSE/DELAY(CLOSE)-1>(CLOSE/DELAY(CLOSE,19))^(1/20)-1))))
+    # 注：DELAY(CLOSE) 缺期数按 1 补；平方项按原文字面取 (A−B−2)²（与
+    # 第二处 (A−B)² 的不对称如实保留）；分母按公式取 COUNT（DolphinDB
+    # 原版误乘 0/1 向量）；LOG 参数非正时置 NaN。
+    a = ctx.c / _delay(ctx.c, 1)
+    b = (ctx.c / _delay(ctx.c, 19)) ** (1 / 20)
+    c_up = _g191_cmp(a - 1, "gt", b - 1)
+    c_dn = _g191_cmp(a - 1, "lt", b - 1)
+    f0 = (a - b - 2) ** 2
+    e = _g191_count(c_up, 20)
+    f = _g191_count(c_dn, 20)
+    f1 = _ts_sum(f0 * c_dn.fillna(0.0), 20)
+    f2 = _ts_sum(f0 * c_up.fillna(0.0), 20)
+    val = (e - 1) * f1 / (f * f2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.log(val.mask(val <= 0))
+
+
+def _g191(ctx: _G191Ctx) -> pd.DataFrame:
+    # ((CORR(MEAN(VOLUME,20), LOW, 5) + ((HIGH + LOW) / 2)) - CLOSE)
+    return _corr(_ts_mean(ctx.v, 20), ctx.l, 5) + (ctx.h + ctx.l) / 2 - ctx.c
+
+
+_G191_FUNCS = {name: globals()[f"_g{name[-3:]}"] for name in ALPHA191_NAMES}
+assert len(_G191_FUNCS) == 191
+
+
+def compute_alpha191(frames: dict[str, pd.DataFrame],
+                     index_close: pd.Series | None = None,
+                     index_open: pd.Series | None = None,
+                     mkt: pd.Series | None = None,
+                     smb: pd.Series | None = None,
+                     hml: pd.Series | None = None,
+                     include: list[str] | None = None) -> dict[str, pd.DataFrame]:
+    """计算国泰君安 191 个短周期价量因子（宽表 × 宽表）。
+
+    参数
+    ----
+    frames : prepare_frames/load_frames 输出的宽表字典（open/high/low/
+             close/volume/vwap/returns，均以日期为行、股票代码为列）。
+    index_close/index_open : 可选，日期索引的基准指数收盘/开盘 Series
+             （gtja075/149/181/182 需要；缺省时这些因子全为 NaN）。
+    mkt/smb/hml : 可选，日期索引的 Fama-French 三因子 Series
+             （gtja030 需要；缺省时该因子全为 NaN）。
+    include : 可选，只计算指定因子（名称如 "gtja001"）。
+
+    返回 {因子名: 日期 × 股票 DataFrame}；±inf 统一替换为 NaN。
+    """
+    names = include if include is not None else ALPHA191_NAMES
+    unknown = set(names) - set(_G191_FUNCS)
+    if unknown:
+        raise ValueError(f"未知 Alpha191 因子: {sorted(unknown)}")
+    ctx = _G191Ctx(frames, index_close=index_close, index_open=index_open,
+                   mkt=mkt, smb=smb, hml=hml)
+    out: dict[str, pd.DataFrame] = {}
+    for name in names:
+        out[name] = _clean_inf(_G191_FUNCS[name](ctx))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 统一入口
 # ---------------------------------------------------------------------------
 
@@ -1817,10 +3739,30 @@ def _selftest() -> int:
         assert not np.isinf(f.to_numpy()).any(), f"{name} 含 ±inf"
     print(f"[ok] Alpha158: {len(a158)} 个（9 K线 + 4 原始价 + 29×5 滚动），无 ±inf")
 
+    # --- 1b. Alpha191 形状与名单（附合成指数与三因子，覆盖全部 191 个）---
+    rng191 = np.random.default_rng(7)
+    idx191 = like.mean(axis=1) * (1 + rng191.normal(0, 0.01, len(like.index)))
+    idx_open191 = idx191.shift(1) * 1.001
+    mkt191 = idx191.pct_change()
+    smb191 = mkt191.rolling(3).mean()
+    hml191 = -mkt191 * 0.5
+    a191 = compute_alpha191(frames, index_close=idx191,
+                            index_open=idx_open191,
+                            mkt=mkt191, smb=smb191, hml=hml191)
+    assert set(a191) == set(ALPHA191_NAMES), "alpha191 名单不完整"
+    for name, f in a191.items():
+        assert f.shape == like.shape, f"{name} 形状错误"
+        assert not np.isinf(f.to_numpy()).any(), f"{name} 含 ±inf"
+    print(f"[ok] Alpha191: {len(a191)} 个（186 仅量价 + 4 指数 + 1 三因子），无 ±inf")
+
     # --- 2. 无未来函数（截断一致性）---
     cut = {k: v.iloc[:200] for k, v in frames.items()}
     short101 = compute_alpha101(cut)
     short158 = compute_alpha158(cut)
+    short191 = compute_alpha191(cut, index_close=idx191.iloc[:200],
+                                index_open=idx_open191.iloc[:200],
+                                mkt=mkt191.iloc[:200], smb=smb191.iloc[:200],
+                                hml=hml191.iloc[:200])
     t0 = 199
     for name in ALPHA101_NAMES:
         assert np.allclose(a101[name].iloc[t0], short101[name].iloc[t0],
@@ -1828,7 +3770,10 @@ def _selftest() -> int:
     for name in ALPHA158_NAMES:
         assert np.allclose(a158[name].iloc[t0], short158[name].iloc[t0],
                            equal_nan=True), f"{name} 截断不一致"
-    print("[ok] 截断一致性（t=199 处与完整计算逐值相等）：101 + 158 全部通过")
+    for name in ALPHA191_NAMES:
+        assert np.allclose(a191[name].iloc[t0], short191[name].iloc[t0],
+                           equal_nan=True), f"{name} 截断不一致"
+    print("[ok] 截断一致性（t=199 处与完整计算逐值相等）：101 + 158 + 191 全部通过")
 
     # --- 3. 无未来函数（未来扰动不变性）---
     perturbed = {k: v.copy() for k, v in frames.items()}
@@ -1838,6 +3783,9 @@ def _selftest() -> int:
     perturbed["returns"] = perturbed["close"].pct_change()
     b101 = compute_alpha101(perturbed)
     b158 = compute_alpha158(perturbed)
+    b191 = compute_alpha191(perturbed, index_close=idx191,
+                            index_open=idx_open191,
+                            mkt=mkt191, smb=smb191, hml=hml191)
     for name in ("alpha001", "alpha004", "alpha012", "alpha026", "alpha032",
                  "alpha060", "alpha101"):
         assert np.allclose(a101[name].iloc[:219], b101[name].iloc[:219],
@@ -1846,6 +3794,12 @@ def _selftest() -> int:
                  "CORD60", "CNTP5", "SUMP20", "VMA5", "WVMA60", "VSUMD30",
                  "RSV10", "RANK20", "IMXD10", "KMID", "VWAP0"):
         assert np.allclose(a158[name].iloc[:219], b158[name].iloc[:219],
+                           equal_nan=True), f"{name} 受未来数据影响"
+    for name in ("gtja001", "gtja005", "gtja010", "gtja023", "gtja028",
+                 "gtja040", "gtja055", "gtja085", "gtja101", "gtja127",
+                 "gtja143", "gtja146", "gtja165", "gtja172", "gtja180",
+                 "gtja183", "gtja191"):
+        assert np.allclose(a191[name].iloc[:219], b191[name].iloc[:219],
                            equal_nan=True), f"{name} 受未来数据影响"
     print("[ok] 未来扰动不变性（前 219 行逐值相等）")
 
@@ -1857,18 +3811,30 @@ def _selftest() -> int:
     gappy["returns"] = _map_cols(gappy["close"], _pct_change_np)
     g101 = compute_alpha101(gappy)
     g158 = compute_alpha158(gappy)
+    g191 = compute_alpha191(gappy, index_close=idx191,
+                            index_open=idx_open191,
+                            mkt=mkt191, smb=smb191, hml=hml191)
     for name in ("alpha012", "alpha026", "alpha032", "alpha101"):
         assert np.isnan(g101[name].iloc[50:54, 1]).all(), f"{name} 停牌行应为 NaN"
         assert np.isnan(g101[name].iloc[80:82, 0]).all(), f"{name} 停牌行应为 NaN"
     for name in ("KMID", "ROC5", "CNTP5", "VMA5"):
         assert np.isnan(g158[name].iloc[50:54, 1]).all(), f"{name} 停牌行应为 NaN"
         assert np.isnan(g158[name].iloc[80:82, 0]).all(), f"{name} 停牌行应为 NaN"
+    for name in ("gtja002", "gtja013", "gtja023", "gtja063", "gtja126",
+                 "gtja143"):
+        assert np.isnan(g191[name].iloc[50:54, 1]).all(), f"{name} 停牌行应为 NaN"
+        assert np.isnan(g191[name].iloc[80:82, 0]).all(), f"{name} 停牌行应为 NaN"
     # 复牌后的值与"去掉停牌行后的连续日历"上计算的逐值一致
     drop_idx = frames["close"].index[50:54].union(frames["close"].index[80:82])
     comp = {k: v.drop(index=drop_idx) for k, v in frames.items()}
     comp["returns"] = _map_cols(comp["close"], _pct_change_np)
     c101 = compute_alpha101(comp)
     c158 = compute_alpha158(comp)
+    c191 = compute_alpha191(comp, index_close=idx191.drop(index=drop_idx),
+                            index_open=idx_open191.drop(index=drop_idx),
+                            mkt=mkt191.drop(index=drop_idx),
+                            smb=smb191.drop(index=drop_idx),
+                            hml=hml191.drop(index=drop_idx))
     for name in ("alpha012", "alpha026", "alpha032", "alpha101"):
         got = g101[name]["s001"].loc[frames["close"].index[54]]
         want = c101[name]["s001"].loc[frames["close"].index[54]]
@@ -1877,6 +3843,11 @@ def _selftest() -> int:
     for name in ("ROC5", "CNTP5", "VMA5", "MA20"):
         got = g158[name]["s000"].loc[frames["close"].index[82]]
         want = c158[name]["s000"].loc[frames["close"].index[82]]
+        assert np.allclose(got, want, equal_nan=True), \
+            f"{name} 复牌后首个值与连续日历不一致"
+    for name in ("gtja013", "gtja063", "gtja143"):
+        got = g191[name]["s001"].loc[frames["close"].index[54]]
+        want = c191[name]["s001"].loc[frames["close"].index[54]]
         assert np.allclose(got, want, equal_nan=True), \
             f"{name} 复牌后首个值与连续日历不一致"
     print("[ok] 停牌缺口：停牌行 NaN，复牌后按个股自身交易日逐值一致")
@@ -1906,6 +3877,7 @@ def _selftest() -> int:
             "vwap": vwap, "returns": c.pct_change()}
     t101 = compute_alpha101(tiny)
     t158 = compute_alpha158(tiny)
+    t191 = compute_alpha191(tiny)
 
     # alpha101 = (close - open) / (high - low + 0.001)
     for t, (cc, oo, hh, ll) in enumerate(zip(c["x"], o["x"], h["x"], l["x"])):
@@ -1958,6 +3930,72 @@ def _selftest() -> int:
     print("[ok] 手工精确值（alpha101/012、KMID/KUP/ROC5/VMA5/SUMP5/RANK5/"
           "BETA5/RSQR5/RESI5/IMAX/IMIN）全部通过")
 
+    # --- 4b. Alpha191 手工精确值（无状态/短窗口因子）---
+    # gtja013 = (high*low)^0.5 - vwap
+    for t in range(6):
+        expect = np.sqrt(h["x"].iloc[t] * l["x"].iloc[t]) - vwap["x"].iloc[t]
+        assert np.isclose(t191["gtja013"]["x"].iloc[t], expect), \
+            f"gtja013 第 {t} 行手工值不符"
+    # gtja126 = (close+high+low)/3；gtja150 = 同式 × volume
+    for t in range(6):
+        tp = (c["x"].iloc[t] + h["x"].iloc[t] + l["x"].iloc[t]) / 3
+        assert np.isclose(t191["gtja126"]["x"].iloc[t], tp)
+        assert np.isclose(t191["gtja150"]["x"].iloc[t], tp * v["x"].iloc[t])
+    # gtja171 = -1*(low-close)*open^5/((close-high)*close^5)
+    for t in range(6):
+        expect = -((l["x"].iloc[t] - c["x"].iloc[t]) * o["x"].iloc[t] ** 5) \
+            / ((c["x"].iloc[t] - h["x"].iloc[t]) * c["x"].iloc[t] ** 5)
+        assert np.isclose(t191["gtja171"]["x"].iloc[t], expect), \
+            f"gtja171 第 {t} 行手工值不符"
+    # gtja002 = -delta(((close-low)-(high-close))/(high-low), 1)
+    for t in range(1, 6):
+        inner = lambda i: ((c["x"].iloc[i] - l["x"].iloc[i])
+                           - (h["x"].iloc[i] - c["x"].iloc[i])) \
+            / (h["x"].iloc[i] - l["x"].iloc[i])
+        assert np.isclose(t191["gtja002"]["x"].iloc[t],
+                          -(inner(t) - inner(t - 1))), \
+            f"gtja002 第 {t} 行手工值不符"
+    # gtja014 = close - delay(close,5)
+    assert np.isclose(t191["gtja014"]["x"].iloc[5],
+                      c["x"].iloc[5] - c["x"].iloc[0])
+    # gtja015 = open/delay(close,1) - 1
+    for t in range(1, 6):
+        assert np.isclose(t191["gtja015"]["x"].iloc[t],
+                          o["x"].iloc[t] / c["x"].iloc[t - 1] - 1)
+    # gtja020 = (close-delay(close,6))/delay(close,6)*100（6 日样本不足 → NaN）
+    assert np.isnan(t191["gtja020"]["x"].iloc[5])
+    # gtja080 = (volume-delay(volume,5))/delay(volume,5)*100
+    assert np.isclose(t191["gtja080"]["x"].iloc[5],
+                      (v["x"].iloc[5] - v["x"].iloc[0]) / v["x"].iloc[0] * 100)
+    # gtja185 = RANK(-(1-open/close)^2)（2 股票横截面分位秩）
+    for t in range(6):
+        xs = [-(1 - o.iloc[t, i] / c.iloc[t, i]) ** 2 for i in range(2)]
+        ranks = pd.Series(xs).rank(pct=True)
+        for i in range(2):
+            assert np.isclose(t191["gtja185"].iloc[t, i], ranks.iloc[i]), \
+                f"gtja185 第 {t} 行手工值不符"
+    # gtja143 = SELF 递推（初值 1；close>prev 时乘 (close/prev-1)）
+    prev = 1.0
+    for t in range(6):
+        if t > 0 and c["x"].iloc[t] > c["x"].iloc[t - 1]:
+            prev *= c["x"].iloc[t] / c["x"].iloc[t - 1] - 1
+        assert np.isclose(t191["gtja143"]["x"].iloc[t], prev), \
+            f"gtja143 第 {t} 行手工值不符"
+    # TSRANK 口径：0 起整数升序名次（并列取 min，完整窗口）
+    s3 = pd.DataFrame({"x": [3.0, 2.0, 5.0, 4.0, 5.0]}, index=dates[:5])
+    tr = _g191_tsrank(s3, 3)
+    assert np.isnan(tr["x"].iloc[0]) and np.isnan(tr["x"].iloc[1])
+    assert tr["x"].iloc[2] == 2.0 and tr["x"].iloc[3] == 1.0 \
+        and tr["x"].iloc[4] == 1.0, f"TSRANK 口径不符: {tr['x'].tolist()}"
+    # SMA 递推口径：y[t] = (m*x[t] + (n-m)*y[t-1]) / n
+    sm = _g191_sma(s3, 3, 1)
+    y = 3.0
+    for t in range(5):
+        y = (1 * s3["x"].iloc[t] + 2 * y) / 3 if t > 0 else s3["x"].iloc[0]
+        assert np.isclose(sm["x"].iloc[t], y), f"SMA 递推口径不符 (t={t})"
+    print("[ok] 手工精确值（gtja002/013/014/015/020/080/126/143/150/171/185、"
+          "TSRANK/SMA 递推口径）全部通过")
+
     # --- 5. 横截面 rank 语义 ---
     # 同一日期上，5 只股票的 rank 分位均值 = (m+1)/(2m)
     r = _rank_cs(frames["close"])
@@ -1982,6 +4020,16 @@ def _selftest() -> int:
     f056 = full["alpha056"]
     assert f056.notna().any().any(), "alpha056 提供 cap 后仍全 NaN"
     print("[ok] 行业/市值依赖：19 个 alpha 缺输入全 NaN，提供后有限值")
+
+    # --- 7. Alpha191 指数/三因子依赖 ---
+    bare191 = compute_alpha191(frames)
+    for name in ALPHA191_NEEDS_INDEX | ALPHA191_NEEDS_FF3:
+        assert bare191[name].isna().all().all(), \
+            f"{name} 未提供输入时应全 NaN"
+    for name in ALPHA191_NEEDS_INDEX | ALPHA191_NEEDS_FF3:
+        f = a191[name]
+        assert f.notna().any().any(), f"{name} 提供输入后仍全 NaN"
+    print("[ok] Alpha191 指数/三因子依赖：5 个因子缺输入全 NaN，提供后有限值")
     print("== selftest 全部通过 ==")
     return 0
 
@@ -1994,6 +4042,11 @@ def _cmd_info() -> int:
     print("Qlib Alpha158 量价部分（Microsoft Qlib, MIT License）")
     print(f"  共 158 个：K 线 9 + 原始价格 4 + 滚动算子 {len(ALPHA158_ROLLING)}"
           f" 种 × {len(ALPHA158_WINDOWS)} 窗口（{ALPHA158_WINDOWS}）。")
+    print("GTJA Alpha191（国泰君安 2017, 短周期价量因子；"
+          "DolphinDB gtja191Alpha v1.0.0 为移植基准）")
+    print(f"  共 191 个：仅量价 186 个；需基准指数开/收盘 4 个"
+          f"（{', '.join(sorted(ALPHA191_NEEDS_INDEX))}）；")
+    print(f"  需 Fama-French 三因子 1 个（{', '.join(sorted(ALPHA191_NEEDS_FF3))}）。")
     print("输入列：open/high/low/close/volume/amount（vwap=amount/volume，"
           "returns=close.pct_change()）。")
     return 0
@@ -2001,17 +4054,17 @@ def _cmd_info() -> int:
 
 def _stream_compute(compute_fn, names: list[str], frames: dict[str, pd.DataFrame],
                     outdir: Path, latest_csv: str, summ_csv: str,
-                    label: str) -> None:
+                    label: str, **kwargs) -> None:
     """逐因子计算并落盘（大股票池下避免同时持有全部因子矩阵）。
 
-    每个因子单独调用 compute_fn(frames, include=[name])，取其统计量后
-    立即释放；内存占用与因子数无关，与股票数×交易日数成正比。
+    每个因子单独调用 compute_fn(frames, include=[name], **kwargs)，取其
+    统计量后立即释放；内存占用与因子数无关，与股票数×交易日数成正比。
     """
     t0 = time.time()
     summ_rows: list[dict] = []
     latest_cols: dict[str, pd.Series] = {}
     for i, name in enumerate(names):
-        res = compute_fn(frames, include=[name])[name]
+        res = compute_fn(frames, include=[name], **kwargs)[name]
         vals = res.to_numpy(dtype=float)
         finite = np.isfinite(vals)
         summ_rows.append({
@@ -2088,17 +4141,39 @@ def _cmd_compute(args: argparse.Namespace) -> int:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    if args.only in ("101", "both"):
+    # 基准指数（gtja075/149/181/182）：可选 CSV，列 date,close[,open]
+    idx_close = idx_open = None
+    if args.index_csv:
+        idx = pd.read_csv(args.index_csv)
+        idx["date"] = pd.to_datetime(idx["date"], errors="coerce")
+        idx = (idx.dropna(subset=["date"]).drop_duplicates("date")
+               .set_index("date").sort_index())
+        if "close" in idx.columns:
+            idx_close = pd.to_numeric(idx["close"], errors="coerce")
+        if "open" in idx.columns:
+            idx_open = pd.to_numeric(idx["open"], errors="coerce")
+        print(f"[info] 基准指数: {args.index_csv}"
+              f"（{'/'.join([c for c in ('close', 'open') if c in idx.columns])}）")
+    elif args.only in ("191", "all"):
+        print("[warn] 未提供 --index-csv：gtja075/149/181/182 将全为 NaN"
+              "（gtja030 另需 Fama-French 三因子，本项目未内置）",
+              file=sys.stderr)
+
+    if args.only in ("101", "both", "all"):
         _stream_compute(compute_alpha101, ALPHA101_NAMES, frames, outdir,
                         "alpha101_latest.csv", "alpha101_coverage_summary.csv",
                         "Alpha101")
-    if args.only in ("158", "both"):
+    if args.only in ("158", "both", "all"):
         _stream_compute(compute_alpha158, ALPHA158_NAMES, frames, outdir,
                         "alpha158_latest.csv", "alpha158_coverage_summary.csv",
                         "Alpha158")
+    if args.only in ("191", "all"):
+        _stream_compute(compute_alpha191, ALPHA191_NAMES, frames, outdir,
+                        "alpha191_latest.csv", "alpha191_coverage_summary.csv",
+                        "Alpha191", index_close=idx_close, index_open=idx_open)
 
     print(f"[ok] 输出目录: {outdir}/（alpha101_latest.csv / "
-          f"alpha158_latest.csv / *_coverage_summary.csv）")
+          f"alpha158_latest.csv / alpha191_latest.csv / *_coverage_summary.csv）")
     print(DISCLAIMER)
     return 0
 
@@ -2129,8 +4204,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--datadir", default="data/daily", help="日线 CSV 目录")
     p.add_argument("--adjust", default="qfq", help="复权方式（qfq/hfq/none）")
     p.add_argument("--outdir", default="output/factors", help="输出目录")
-    p.add_argument("--only", choices=["101", "158", "both"], default="both",
-                   help="只计算哪个因子库")
+    p.add_argument("--only", choices=["101", "158", "191", "both", "all"],
+                   default="both",
+                   help="只计算哪个因子库（both=101+158；all=101+158+191）")
+    p.add_argument("--index-csv", default=None,
+                   help="基准指数日线 CSV（date,close[,open] 列；供 "
+                        "gtja075/149/181/182 使用，缺省时这 4 个因子全 NaN）")
     p.add_argument("--offline", action="store_true",
                    help="offline 模式（只用本地缓存，不访问网络）")
     p.add_argument("--no-fetch", action="store_true",

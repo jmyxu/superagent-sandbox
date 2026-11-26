@@ -1,6 +1,7 @@
-﻿"""打板腿(首板回调v2) TP×SL 参数网格 —— 独立实现, 与基线对照
+"""打板腿(首板回调v2) TP×SL 参数网格 —— 独立实现, 与基线对照
 规则与基线一致: 评分门槛12 / 开盘买 / T+1买日禁卖 / 日级NAV+槽位K2+现金约束 /
 涨停骑乘 / 止损收盘判 / 最长8日. 报告每格 胜率/年化/回撤/成交数.
+最优格按 年化+回撤 评分(评分=年化/|回撤|) 选出, 胜率仅作参考.
 
 数据: 日线 D:\\tsp-data\\kline_daily_enriched (2021-01~2026-07)
      分钟 C:\\Users\\j6752\\.dsh\\superagent-tools\\min_bars_cache.json (2022-08~2026-07)
@@ -209,14 +210,22 @@ def main():
             line += f"{wr:4.0f}/{ann*100:+5.1f}/{dd*100:4.1f}/{fills:4d}   "
         print(line)
 
-    best_ann = max(results, key=lambda r: r["ann"])
+    print()
+    print("年化+回撤评分排名 (评分=年化/|回撤|, 越高越好; 胜率仅作参考):")
+    scored = sorted(((r["ann"] / abs(r["dd"]), r) for r in results),
+                    key=lambda x: -x[0])
+    for rank, (s, r) in enumerate(scored, 1):
+        print(f"#{rank:2d} TP{r['tp']*100:.1f}% SL{r['sl']*100:.0f}%: 评分{s:5.2f} "
+              f"胜率{r['wr']:4.1f}% 年化{r['ann']*100:+6.1f}% "
+              f"回撤{r['dd']*100:5.1f}% 成交{r['fills']:4d}")
+    best = scored[0][1]
+    print(f"\n年化+回撤最优格: TP{best['tp']*100:.1f}% SL{best['sl']*100:.0f}% → "
+          f"胜率{best['wr']:.1f}% 年化{best['ann']*100:+.1f}% "
+          f"回撤{best['dd']*100:.1f}% 成交{best['fills']}")
     best_wr = max(results, key=lambda r: r["wr"])
-    print(f"\n年化最优: TP{best_ann['tp']*100:.1f}% SL{best_ann['sl']*100:.0f}% → "
-          f"胜率{best_ann['wr']:.1f}% 年化{best_ann['ann']*100:+.1f}% "
-          f"回撤{best_ann['dd']*100:.1f}% 成交{best_ann['fills']}")
-    print(f"胜率最优: TP{best_wr['tp']*100:.1f}% SL{best_wr['sl']*100:.0f}% → "
-          f"胜率{best_wr['wr']:.1f}% 年化{best_wr['ann']*100:+.1f}% "
-          f"回撤{best_wr['dd']*100:.1f}% 成交{best_wr['fills']}")
+    print(f"(胜率最高格 TP{best_wr['tp']*100:.1f}% SL{best_wr['sl']*100:.0f}%: "
+          f"胜率{best_wr['wr']:.1f}% 但年化仅{best_wr['ann']*100:+.1f}% "
+          f"回撤{best_wr['dd']*100:.1f}%, 不以胜率为目标, 不入选)")
     print(f"用时 {time.time()-t0:.0f}s")
 
 
